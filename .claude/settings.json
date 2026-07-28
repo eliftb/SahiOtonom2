@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git --version)",
+      "Bash(gh auth *)",
+      "Read(//home/sahi/.ssh/**)",
+      "Bash(git init *)",
+      "Bash(git lfs *)",
+      "Bash(git config *)",
+      "Bash(git branch *)",
+      "Bash(git add *)",
+      "Bash(git rm *)",
+      "Bash(grep -v \"^$\")",
+      "Bash(git diff *)"
+    ]
+  }
+}

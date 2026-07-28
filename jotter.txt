@@ -1,0 +1,4 @@
+Parkur ve Araba tek bir launch komutu ile çalışmasını sağlama
+Test verisinin pt dosyası custom modelde değiştirilecek.
+
+docker build --build-arg GITHUB_TOKEN=$GITHUB_TOKEN -t my_ros_imagev1 .

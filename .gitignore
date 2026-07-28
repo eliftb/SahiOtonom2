@@ -1,0 +1,39 @@
+# ROS2 colcon build çıktıları (otomatik üretilir, repoya girmemeli)
+build/
+install/
+log/
+
+# Python sanal ortamları
+venv/
+.venv/
+env/
+zedenv/
+__pycache__/
+*.pyc
+
+# Editor / IDE
+.vscode/
+
+# Node.js
+node_modules/
+
+# macOS
+.DS_Store
+
+# Log ve geçici dosyalar
+*.log
+
+# Üçüncü parti ROS2 paketleri (ayrı git repoları, kendi upstream'inden klonlanır)
+# https://github.com/Slamtec/sllidar_ros2
+# https://github.com/stereolabs/zed-ros2-wrapper
+sllidar_ros2/
+src/sllidar_ros2/
+src/zed-ros2-wrapper/
+
+# Bozuk/eksik LFS pointer'ları (gerçek içerik bu makinede yok)
+src/yolov8/src/yolov8_object_detection/scripts/custom_yolov8_model/best.pt
+src/yolov8/src/yolov8_object_detection/scripts/custom_yolov8_model/ti-best.pt
+src/yolov8/src/yolov8_object_detection/scripts/custom_yolov8_model/nisan5-ilktest.pt
+src/yolov8/src/yolov8_object_detection/scripts/yolov8n.pt
+src/yolov8/src/yolov8_object_detection/scripts/custom_yolov8_model/zk-best.pt
+src/yolov8/src/yolov8_object_detection/scripts/custom_yolov8_model/last-best.pt

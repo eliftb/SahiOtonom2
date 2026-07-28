@@ -1,0 +1,4 @@
+gps_node:
+  ros__parameters:
+    port: "/dev/ttyUSB0"
+    baudrate: 4800
