@@ -54,9 +54,7 @@ class LidarAngleFilterNode(Node):
             angle_increment = scan_msg.angle_increment
             
             # Açıları hesapla (radyandan dereceye çevir)
-            angles_rad = np.arange(angle_min, 
-                                 angle_min + len(ranges) * angle_increment, 
-                                 angle_increment)
+            angles_rad = angle_min + np.arange(len(ranges)) * angle_increment
             angles_deg = np.degrees(angles_rad)
             
             # Sonsuz ve NaN değerleri temizle
@@ -152,12 +150,12 @@ class LidarAngleFilterNode(Node):
         """
         # Bool mesajı
         obstacle_msg = Bool()
-        obstacle_msg.data = obstacle_detected
+        obstacle_msg.data = bool(obstacle_detected)
         self.obstacle_pub.publish(obstacle_msg)
-        
+
         # Float32 mesajı
         distance_msg = Float32()
-        distance_msg.data = closest_distance if closest_distance != float('inf') else -1.0
+        distance_msg.data = float(closest_distance) if closest_distance != float('inf') else -1.0
         self.distance_pub.publish(distance_msg)
         
         # String mesajı

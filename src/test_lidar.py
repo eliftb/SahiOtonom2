@@ -1,9 +1,16 @@
+import os
+import sys
+
 from rplidar import RPLidar
 
-PORT = '/dev/ttyUSB0'
-BAUD = 256000
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                '..', 'SahiOtonom', 'EngelTespit'))
+from lidar_port import BAUDRATE, find_port
 
-lidar = RPLidar(PORT, baudrate=BAUD)
+PORT = find_port()
+
+lidar = RPLidar(PORT, baudrate=BAUDRATE)
 info = lidar.get_info()
+print(f"Port: {PORT}")
 print("Lidar bilgisi:", info)
 lidar.disconnect()

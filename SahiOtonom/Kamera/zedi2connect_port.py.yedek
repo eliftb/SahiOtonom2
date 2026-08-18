@@ -1,24 +1,13 @@
-import os
 import signal
 import sys
 import time
 
 import rclpy
 from rclpy.node import Node
-from rclpy.executors import ExternalShutdownException
 from sensor_msgs.msg import Image
-from nav_msgs.msg import Odometry
-from geometry_msgs.msg import Quaternion
 from cv_bridge import CvBridge
 import pyzed.sl as sl
 import cv2
-
-# Kalıcı ayarlar (bkz. kalibrasyon.yaml). Bu düğüm alt klasörde olduğu için
-# proje kökü arama yoluna ekleniyor.
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from kalibrasyon import kalibrasyon
-
-KAL = kalibrasyon('zed_publisher_node')
 
 # Araçtaki ZED 2i'nin seri numarası. /dev/videoN numarası takılma sırasına göre
 # değişir (dizüstünün dahili kamerası video0/video1'i kapıyor), seri numarası
@@ -38,21 +27,11 @@ class ZEDPublisherNode(Node):
         self.declare_parameter('camera_fps', 30)
         self.declare_parameter('open_retries', 5)
         self.declare_parameter('open_retry_delay', 2.0)
-        # ODOMETRİ (görsel-eylemsel konum takibi). VARSAYILAN KAPALI.
-        # Kapalıyken bu düğüm bugüne kadar ne yapıyorsa aynısını yapar: derinlik
-        # kapalı kalır, ek yayın olmaz, timer_callback'te ek iş yapılmaz.
-        # Açmak GPU'ya derinlik hesabı ekler ve şerit/levha tespitiyle aynı kartı
-        # paylaşır - açtıktan sonra FPS'i ölçmeden pistte kullanmayın.
-        # Değeri kalibrasyon.yaml'dan gelir; orada yoksa KAPALI kalır.
-        # launch_all_nodes.py parametre geçirmediği için açma/kapama tek
-        # yerden yapılabilsin diye böyle: yaml'ı düzenle, sistemi yeniden başlat.
-        self.declare_parameter('enable_odometry', KAL('enable_odometry', False))
 
         serial = self.get_parameter('camera_serial').value
         fps = self.get_parameter('camera_fps').value
         retries = self.get_parameter('open_retries').value
         retry_delay = self.get_parameter('open_retry_delay').value
-        self.odometri_acik = bool(self.get_parameter('enable_odometry').value)
 
         # SDK 0'ı "varsayılan fps" sayar ama biz timer periyodunu 1/fps ile
         # hesapladığımız için 0 gelirse sıfıra bölme olur.
@@ -69,44 +48,15 @@ class ZEDPublisherNode(Node):
         init_params = sl.InitParameters()
         init_params.camera_resolution = sl.RESOLUTION.HD720
         init_params.camera_fps = fps
-        if self.odometri_acik:
-            # Konum takibi derinlik olmadan çalışmaz. En hafif mod seçiliyor:
-            # NEURAL doğruluk için daha iyi ama GPU'yu şerit/levha tespitiyle
-            # paylaştığımız için burada maliyet doğruluktan önemli.
-            init_params.depth_mode = sl.DEPTH_MODE.PERFORMANCE
-            init_params.coordinate_units = sl.UNIT.METER
-            # ROS uyumu: x ileri, y sola, z yukarı
-            init_params.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Z_UP_X_FWD
-        else:
-            # Bu düğüm sadece sol RGB görüntüyü yayınlıyor, derinlik hiç okunmuyor.
-            # SDK varsayılanı NEURAL; kapatmazsak sinir ağı derinlik modeli boşuna
-            # GPU'ya yükleniyor ve YOLO ile şerit tespitiyle aynı VRAM'i paylaşıyor.
-            init_params.depth_mode = sl.DEPTH_MODE.NONE
+        # Bu düğüm sadece sol RGB görüntüyü yayınlıyor, derinlik hiç okunmuyor.
+        # SDK varsayılanı NEURAL; kapatmazsak sinir ağı derinlik modeli boşuna
+        # GPU'ya yükleniyor ve YOLO ile şerit tespitiyle aynı VRAM'i paylaşıyor.
+        init_params.depth_mode = sl.DEPTH_MODE.NONE
         if serial:
             # Doğru kameraya bağlan; başka bir kamera takılıysa onu açmasın.
             init_params.set_from_serial_number(serial)
 
         self._open_camera(init_params, serial, retries, retry_delay)
-
-        # Odometri SADECE istendiyse kurulur ve HATA FIRLATMAZ: bu düğüm kritik,
-        # burada bir istisna tüm sistemi kapatır. Kurulamazsa kendini kapatıp
-        # görüntü yayınına devam eder.
-        self.odom_publisher = None
-        self.zed_pose = None
-        if self.odometri_acik:
-            try:
-                tracking_params = sl.PositionalTrackingParameters()
-                hata = self.zed.enable_positional_tracking(tracking_params)
-                if hata != sl.ERROR_CODE.SUCCESS:
-                    raise ZEDCameraError(str(hata))
-                self.zed_pose = sl.Pose()
-                self.odom_publisher = self.create_publisher(Odometry, '/zed2i/odom', 10)
-                self.get_logger().info('🧭 ZED odometrisi açık -> /zed2i/odom')
-            except Exception as e:
-                self.odometri_acik = False
-                self.odom_publisher = None
-                self.get_logger().error(
-                    f'Odometri açılamadı ({e}). Görüntü yayını normal sürüyor.')
 
         # Kamera hazır olmadan timer'ı kurma, yoksa grab() boşa çağrılır.
         self.timer = self.create_timer(1.0 / fps, self.timer_callback)
@@ -171,54 +121,12 @@ class ZEDPublisherNode(Node):
             self.publisher_.publish(msg)
             # 30 FPS'te her kareyi loglamak terminali boğuyor, seyrelt.
             self.get_logger().debug("Görüntü yayınlandı.")
-
-            # Odometri GÖRÜNTÜDEN SONRA ve ayrı korumada: buradaki bir hata
-            # görüntü yayınını hiçbir şekilde etkilemesin.
-            if self.odometri_acik:
-                self._yayinla_odometri(msg.header.stamp)
         else:
             self.get_logger().warning("ZED'den görüntü alınamadı.",
                                       throttle_duration_sec=2.0)
 
-    def _yayinla_odometri(self, stamp):
-        """ZED'in konum takibinden Odometry mesajı üretir.
-
-        Hata durumunda SESSİZCE kendini kapatır: odometri yardımcı bir veri,
-        yokluğu aracı durdurmamalı ama her karede hata basıp logu boğmamalı.
-        """
-        try:
-            durum = self.zed.get_position(self.zed_pose, sl.REFERENCE_FRAME.WORLD)
-            if durum == sl.POSITIONAL_TRACKING_STATE.OFF:
-                return
-
-            t = self.zed_pose.get_translation().get()
-            q = self.zed_pose.get_orientation().get()
-
-            odom = Odometry()
-            odom.header.stamp = stamp
-            odom.header.frame_id = 'odom'
-            odom.child_frame_id = 'base_link'
-            odom.pose.pose.position.x = float(t[0])
-            odom.pose.pose.position.y = float(t[1])
-            odom.pose.pose.position.z = float(t[2])
-            odom.pose.pose.orientation = Quaternion(
-                x=float(q[0]), y=float(q[1]), z=float(q[2]), w=float(q[3]))
-            self.odom_publisher.publish(odom)
-        except Exception as e:
-            self.odometri_acik = False
-            self.get_logger().error(
-                f'Odometri okunamadı, kapatıldı ({e}). Görüntü yayını sürüyor.')
-
     def destroy_node(self):
-        # rclpy.ok() kontrolü: kapanış sırasında context zaten geçersizleşmiş
-        # olabiliyor ve logger "Failed to publish log message to rosout" basıyordu.
-        if rclpy.ok():
-            self.get_logger().info("ZED kamera kapatılıyor...")
-        try:
-            if self.odometri_acik:
-                self.zed.disable_positional_tracking()
-        except Exception:
-            pass
+        self.get_logger().info("ZED kamera kapatılıyor...")
         self.zed.close()
         super().destroy_node()
 
@@ -231,13 +139,7 @@ def _sigterm_handler(signum, frame):
     cihazı görmeye devam eder ama SDK 'CAMERA STREAM FAILED TO START' der
     ve kurtarmak için USB reset gerekir. Launcher düğümleri kapatırken
     process.terminate() (SIGTERM) kullandığı için bu her kapanışta oluyordu.
-
-    SADECE İLK sinyalde iş görür: launcher kapanışta ikinci bir SIGTERM
-    gönderdiğinde bu zed.close()'un ORTASINDA tekrar KeyboardInterrupt fırlatıp
-    traceback basıyordu. İlk sinyalden sonra varsayılan davranışa dönüyoruz -
-    temizlik zaten başlamış durumda.
     """
-    signal.signal(signal.SIGTERM, signal.SIG_DFL)
     raise KeyboardInterrupt
 
 
@@ -249,7 +151,7 @@ def main(args=None):
     try:
         node = ZEDPublisherNode()
         rclpy.spin(node)
-    except (KeyboardInterrupt, ExternalShutdownException):
+    except KeyboardInterrupt:
         pass
     except ZEDCameraError as e:
         print(f"HATA: {e}", file=sys.stderr)

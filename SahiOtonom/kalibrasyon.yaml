@@ -1,0 +1,21 @@
+# SAHI OTONOM - kalici kalibrasyon degerleri
+# Bu dosya kalibrasyon araclari tarafindan guncellenir.
+# Elle de duzenlenebilir; dugum adi -> parametre adi -> deger.
+
+decision_making_node:
+  ref_box_height_px: 60.0
+  ref_distance_m: 4.0
+lane_detection_node:
+  camera_center_offset_px: +99.0
+  hood_frac: 0.82
+  lane_width_frac: 0.4
+  route_source: serit
+launcher:
+  kayit: false
+lidar_obstacle_detector:
+  corridor_half_width_m: 0.5
+  forward_angle_deg: 0.0
+uart_sender_node:
+  steering_trim: 0
+zed_publisher_node:
+  enable_odometry: true

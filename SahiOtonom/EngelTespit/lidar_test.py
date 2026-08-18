@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 from rplidar import RPLidar
 
-# Lidar portu (senin durumunda /dev/ttyUSB0)
-PORT_NAME = '/dev/ttyUSB0'
+from lidar_port import BAUDRATE, find_port
 
-# S1 genelde 256000 baud kullanır
-lidar = RPLidar(PORT_NAME, baudrate=256000)
+PORT_NAME = find_port()
+
+lidar = RPLidar(PORT_NAME, baudrate=BAUDRATE)
 
 try:
-    print("Lidar başlatıldı. Ölçümler geliyor...\n")
+    print(f"Lidar başlatıldı ({PORT_NAME} @ {BAUDRATE}). Ölçümler geliyor...\n")
     for scan in lidar.iter_scans():
         # Her scan: [(quality, angle, distance), ...]
         for (_, angle, distance) in scan:

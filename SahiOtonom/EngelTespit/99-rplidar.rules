@@ -1,0 +1,12 @@
+# RPLIDAR için sabit cihaz adı: /dev/rplidar
+#
+# Kurulum:
+#   sudo cp SahiOtonom/EngelTespit/99-rplidar.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#   (lidar'ı çıkarıp tak, sonra kontrol et:  ls -l /dev/rplidar)
+#
+# Eşleşme seri numarasıyla yapılır. Sadece idVendor/idProduct (10c4:ea60)
+# kullanmak RİSKLİ: o kimlik tüm Silicon Labs CP210x adaptörlerinde ortak,
+# başka bir CP210x cihaz takınca kural yanlış cihazı yakalar.
+
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", ATTRS{serial}=="323ebac4046ff011823b549b1045c30f", SYMLINK+="rplidar", MODE="0666", GROUP="dialout"

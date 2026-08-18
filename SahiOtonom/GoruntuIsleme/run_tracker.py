@@ -1,6 +1,7 @@
 # Dosya Adı: sign_detector_node.py
 import rclpy
 from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 from cv_bridge import CvBridge
@@ -122,7 +123,14 @@ class SignDetectionNode(Node):
                 cv2.rectangle(frame, (x1, y1 - 20), (x1 + w_text, y1), color, -1)
                 cv2.putText(frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2) # Yazı Beyaz
 
-                stable_boxes.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2, "label": label})
+                # label ekrana çizim için (combined_view onu kullanır); cls ve id
+                # ise KARAR ALMA için: sınıf adını "ID:3 dur" metninden ayrıştırmak
+                # zorunda kalmasın, levhayı takip numarasıyla tanıyabilsin
+                # (aynı 'dur' levhasında ikinci kez durmamak için gerekiyor).
+                stable_boxes.append({"x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                                     "label": label,
+                                     "cls": stable_class_name,
+                                     "id": int(track_id)})
 
         return frame, stable_boxes
 
@@ -134,11 +142,15 @@ class SignDetectionNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = SignDetectionNode()
-    try: rclpy.spin(node)
-    except KeyboardInterrupt: pass
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        # Launcher kritik düğüm ölünce hepsini kapatıyor; bu normal kapanış.
+        pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

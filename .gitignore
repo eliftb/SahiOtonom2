@@ -37,3 +37,6 @@ src/yolov8/src/yolov8_object_detection/scripts/custom_yolov8_model/nisan5-ilktes
 src/yolov8/src/yolov8_object_detection/scripts/yolov8n.pt
 src/yolov8/src/yolov8_object_detection/scripts/custom_yolov8_model/zk-best.pt
 src/yolov8/src/yolov8_object_detection/scripts/custom_yolov8_model/last-best.pt
+
+# Pist kayitlari (ham sensor verisi, GB boyutunda - repoya girmemeli)
+SahiOtonom/kayitlar/

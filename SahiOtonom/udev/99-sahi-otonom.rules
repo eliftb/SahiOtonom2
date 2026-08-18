@@ -1,0 +1,38 @@
+# SAHI OTONOM - sabit cihaz isimleri
+#
+# NEDEN: /dev/ttyUSB0, ttyUSB1 ... numaraları takma SIRASINA göre dağıtılır.
+# Çoklayıcı (hub) kullanınca sıra her açılışta değişebilir; direksiyon/gaz
+# komutlarının LiDAR'a gitmesi bu yüzden mümkün. Aşağıdaki kurallar her cihaza
+# donanım kimliğinden türeyen SABİT bir isim verir.
+#
+# KURULUM:
+#   sudo cp SahiOtonom/udev/99-sahi-otonom.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#   (cihazları çıkarıp takın, sonra: ls -l /dev/sahi_*)
+
+# --- LiDAR: Silicon Labs CP2102N -------------------------------------------
+# Bu çipin BENZERSİZ seri numarası var, o yüzden hangi porta takılırsa takılsın
+# doğru tanınır. Seri numarası cihaza özeldir: LiDAR'ı değiştirirseniz
+#   udevadm info -q property -n /dev/ttyUSB0 | grep ID_SERIAL_SHORT
+# ile yenisini okuyup buraya yazın.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", ATTRS{serial}=="323ebac4046ff011823b549b1045c30f", SYMLINK+="sahi_lidar"
+
+# --- Arduino: CH340 / CH9102 (WCH) -----------------------------------------
+# DİKKAT: CH340 çiplerinin çoğunda seri numarası YOKTUR. Bu yüzden cihazı
+# seriyle ayırt edemiyoruz; aşağıdaki kural "bu bilgisayardaki TEK WCH çipi"
+# varsayımına dayanır. Bugün doğru, ama ikinci bir CH340 takarsanız bozulur.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", SYMLINK+="sahi_mix"
+
+# --- İKİNCİ BİR CH340 EKLERSENİZ -------------------------------------------
+# Yukarıdaki satırı kapatıp aşağıdakini açın: cihazı seriyle değil, FİZİKSEL
+# PORT KONUMUYLA sabitler. Arduino'yu hub'ın hep AYNI soketine takmanız şartıyla
+# çalışır. Kendi port yolunuzu şöyle okuyun (Arduino takılıyken):
+#   udevadm info -q property -n /dev/ttyUSB0 | grep DEVPATH
+# çıktıdaki ".../usb1/1-4/1-4:1.0/..." kısmındaki "1-4:1.0" değerini yazın.
+#SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", KERNELS=="1-4:1.0", SYMLINK+="sahi_mix"
+
+# --- ZED 2i ----------------------------------------------------------------
+# ZED için udev kuralı GEREKMİYOR: kamera bir /dev/tty* aygıtı oluşturmuyor,
+# zedi2connect_port.py kameraya SDK üzerinden seri numarasıyla bağlanıyor
+# (set_from_serial_number). Kamera için kritik olan sabit isim değil, USB 3.0
+# bağlantısı ve yeterli besleme.
