@@ -1,4 +1,3 @@
-import os
 import signal
 import sys
 import time
@@ -6,19 +5,12 @@ import time
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import ExternalShutdownException
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CameraInfo
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Quaternion
 from cv_bridge import CvBridge
 import pyzed.sl as sl
 import cv2
-
-# Kalıcı ayarlar (bkz. kalibrasyon.yaml). Bu düğüm alt klasörde olduğu için
-# proje kökü arama yoluna ekleniyor.
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from kalibrasyon import kalibrasyon
-
-KAL = kalibrasyon('zed_publisher_node')
 
 # Araçtaki ZED 2i'nin seri numarası. /dev/videoN numarası takılma sırasına göre
 # değişir (dizüstünün dahili kamerası video0/video1'i kapıyor), seri numarası
@@ -43,10 +35,11 @@ class ZEDPublisherNode(Node):
         # kapalı kalır, ek yayın olmaz, timer_callback'te ek iş yapılmaz.
         # Açmak GPU'ya derinlik hesabı ekler ve şerit/levha tespitiyle aynı kartı
         # paylaşır - açtıktan sonra FPS'i ölçmeden pistte kullanmayın.
-        # Değeri kalibrasyon.yaml'dan gelir; orada yoksa KAPALI kalır.
-        # launch_all_nodes.py parametre geçirmediği için açma/kapama tek
-        # yerden yapılabilsin diye böyle: yaml'ı düzenle, sistemi yeniden başlat.
-        self.declare_parameter('enable_odometry', KAL('enable_odometry', False))
+        # AÇIK: kavşakta yön tutma (uart_sender_node) ve virajın metrik
+        # takibi (serit-tespitcopy) odometriye dayanıyor; kapatırsan araç
+        # kavşakta açık döngüye düşer. Kapatmak için burayı False yap ve
+        # sistemi yeniden başlat.
+        self.declare_parameter('enable_odometry', True)
 
         serial = self.get_parameter('camera_serial').value
         fps = self.get_parameter('camera_fps').value
@@ -61,8 +54,18 @@ class ZEDPublisherNode(Node):
             fps = 30
 
         self.publisher_ = self.create_publisher(Image, '/zed2i_rgb/image_raw', 10)
+        # DERİNLİK. Şerit takibi piksel geometrisiyle metre tahmin etmek yerine
+        # ZED'in ölçtüğü GERÇEK mesafeyi kullanır: aracın orta çizgisi ile
+        # sağdaki kırmızı çizgi arasındaki uzaklık doğrudan metre cinsinden
+        # bilinir. Bu, ufuk/şerit-genişliği kalibrasyonuna olan bağımlılığı
+        # tamamen kaldırır (o varsayımlar bu pistte tutmuyordu).
+        self.depth_publisher = self.create_publisher(Image, '/zed2i/depth', 1)
+        # İç parametreler (fx, cx...) olmadan piksel -> metre çevrilemez.
+        self.info_publisher = self.create_publisher(CameraInfo, '/zed2i/camera_info', 1)
         self.bridge = CvBridge()
         self.image = sl.Mat()
+        self.depth = sl.Mat()
+        self.camera_info_msg = None
         self.get_logger().info("ZEDPublisherNode başlatılıyor...")
 
         self.zed = sl.Camera()
@@ -78,10 +81,13 @@ class ZEDPublisherNode(Node):
             # ROS uyumu: x ileri, y sola, z yukarı
             init_params.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Z_UP_X_FWD
         else:
-            # Bu düğüm sadece sol RGB görüntüyü yayınlıyor, derinlik hiç okunmuyor.
-            # SDK varsayılanı NEURAL; kapatmazsak sinir ağı derinlik modeli boşuna
-            # GPU'ya yükleniyor ve YOLO ile şerit tespitiyle aynı VRAM'i paylaşıyor.
-            init_params.depth_mode = sl.DEPTH_MODE.NONE
+            # Odometri kapalı olsa bile derinlik GEREKLİ: şerit takibi artık
+            # metrik mesafe ölçüyor (bkz. /zed2i/depth). PERFORMANCE en hafif
+            # mod - NEURAL doğruluk için daha iyi ama GPU'yu şerit/levha
+            # tespitiyle paylaşıyoruz.
+            init_params.depth_mode = sl.DEPTH_MODE.PERFORMANCE
+            init_params.coordinate_units = sl.UNIT.METER
+            init_params.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Z_UP_X_FWD
         if serial:
             # Doğru kameraya bağlan; başka bir kamera takılıysa onu açmasın.
             init_params.set_from_serial_number(serial)
@@ -172,6 +178,14 @@ class ZEDPublisherNode(Node):
             # 30 FPS'te her kareyi loglamak terminali boğuyor, seyrelt.
             self.get_logger().debug("Görüntü yayınlandı.")
 
+            # Derinlik ve iç parametreler. Görüntüden SONRA ve ayrı korumada:
+            # buradaki bir hata görüntü yayınını durdurmasın.
+            try:
+                self._yayinla_derinlik(msg.header.stamp)
+            except Exception as e:
+                self.get_logger().warning(f'Derinlik yayınlanamadı: {e}',
+                                          throttle_duration_sec=5.0)
+
             # Odometri GÖRÜNTÜDEN SONRA ve ayrı korumada: buradaki bir hata
             # görüntü yayınını hiçbir şekilde etkilemesin.
             if self.odometri_acik:
@@ -179,6 +193,40 @@ class ZEDPublisherNode(Node):
         else:
             self.get_logger().warning("ZED'den görüntü alınamadı.",
                                       throttle_duration_sec=2.0)
+
+    def _yayinla_derinlik(self, stamp):
+        """Derinlik haritasını ve kamera iç parametrelerini yayınlar.
+
+        Şerit takibi bunlarla piksel konumunu METREYE çevirir: bir pikselin
+        yanal uzaklığı (u - cx) * derinlik / fx. Böylece 'araç orta çizgisi ile
+        sağdaki çizgi arası 1.5 m' gibi gerçek bir hedef tanımlanabiliyor.
+        """
+        self.zed.retrieve_measure(self.depth, sl.MEASURE.DEPTH)
+        derinlik = self.depth.get_data()          # float32, metre, gecersiz = nan/inf
+        d_msg = self.bridge.cv2_to_imgmsg(derinlik, encoding='32FC1')
+        d_msg.header.stamp = stamp
+        d_msg.header.frame_id = 'zed2i_left_camera'
+        self.depth_publisher.publish(d_msg)
+
+        if self.camera_info_msg is None:
+            # Bir kez kurulur: kamera açıkken iç parametreler değişmez.
+            cal = self.zed.get_camera_information().camera_configuration.calibration_parameters
+            sol = cal.left_cam
+            bilgi = CameraInfo()
+            bilgi.width = int(derinlik.shape[1])
+            bilgi.height = int(derinlik.shape[0])
+            bilgi.k = [sol.fx, 0.0, sol.cx,
+                       0.0, sol.fy, sol.cy,
+                       0.0, 0.0, 1.0]
+            bilgi.p = [sol.fx, 0.0, sol.cx, 0.0,
+                       0.0, sol.fy, sol.cy, 0.0,
+                       0.0, 0.0, 1.0, 0.0]
+            self.camera_info_msg = bilgi
+            self.get_logger().info(
+                f'📷 Kamera ic parametreleri: fx={sol.fx:.1f} cx={sol.cx:.1f}')
+        self.camera_info_msg.header.stamp = stamp
+        self.camera_info_msg.header.frame_id = 'zed2i_left_camera'
+        self.info_publisher.publish(self.camera_info_msg)
 
     def _yayinla_odometri(self, stamp):
         """ZED'in konum takibinden Odometry mesajı üretir.

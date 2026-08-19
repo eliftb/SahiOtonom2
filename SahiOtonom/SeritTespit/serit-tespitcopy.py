@@ -1,30 +1,29 @@
 #!/usr/bin/env python3
 
+import math
 import os
-import sys
 import time
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import ExternalShutdownException
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CameraInfo
 from std_msgs.msg import Float32, Int32, Bool
 from rcl_interfaces.msg import SetParametersResult
 from cv_bridge import CvBridge
 import cv2
 import torch
 import numpy as np
+import collections
 
 from utils.utils import (
     select_device,
     driving_area_mask, lane_line_mask
 )
 
-# Kalıcı kalibrasyon değerleri (bkz. kalibrasyon.yaml). Bu düğüm alt klasörde
-# olduğu için proje kökü arama yoluna ekleniyor.
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from kalibrasyon import kalibrasyon
-
-KAL = kalibrasyon('lane_detection_node')
+# NOT: Bu düğümün ayarları AŞAĞIDA, declare_parameter satırlarında sabittir.
+# (kalibrasyon.yaml 2026-08-18'de kaldırıldı.) Pistte yeniden başlatmadan
+# denemek için 'ros2 param set /lane_detection_node <ad> <deger>', beğendiğin
+# değeri buraya yaz - yoksa sistem kapanınca kaybolur.
 
 class LaneDetectionNode(Node):
     def __init__(self):
@@ -66,14 +65,88 @@ class LaneDetectionNode(Node):
         # boyunca ölçüme değil tahmine dayanır ve araç savrulur. UART düğümü bu
         # bayrağı görünce şerit takibini bırakıp ODOMETRİYLE yön tutmaya geçer.
         self.lane_valid_pub = self.create_publisher(Bool, '/lane/valid', 10)
+        # KALİBRASYON İÇİN: en yakın satırda (sample_rows[0]) ölçülen, dik
+        # genişliğe çevrilmiş şerit genişliği. _expected_lane_width ile AYNI
+        # birimde - lane_width_frac kalibrasyonu bunu kullanır (bkz.
+        # kalibrasyon_lane_width.py). Sadece yayın, kontrol yolunu etkilemez.
+        self.width_px_pub = self.create_publisher(Float32, '/lane/width_px', 10)
+        # KALİBRASYON İÇİN: viraj ileri besleme terimi (uzak satır - yakın satır).
+        # Kamera ileri baktığı için "şerit dönüyor" ile "araç şeride göre AÇILI"
+        # ayırt edilemez; ikisi de bunu sıfırdan uzaklaştırır. Offset kalibrasyonu
+        # aracın şeride PARALEL olmasını şart koştuğu için ölçüm buna bakıp
+        # hizasız duruşu reddeder (bkz. kalibrasyon_kamera.py).
+        self.curve_pub = self.create_publisher(Float32, '/lane/curve', 10)
+
+        # --- METRİK SAĞ ÇİZGİ TAKİBİ (route_source='mesafe') ---------------
+        # Piksel geometrisi yerine ZED'in ölçtüğü GERÇEK mesafeyi kullanır.
+        # Gerekçe: gerçek kayıtta satırların %85'inde model tek çizgi görüyor;
+        # iki çizgiye dayanan şerit-ortası hesabı bu yüzden kararsızdı ve
+        # merkez bir şerit öteye sıçrayabiliyordu. Tek bir çizgiye sabit
+        # METRİK mesafede gitmek bu varsayıma hiç ihtiyaç duymuyor.
+        self.depth_image = None
+        self.fx = None
+        self.cx = None
+        self.create_subscription(Image, '/zed2i/depth', self.depth_callback, 1)
+        self.create_subscription(CameraInfo, '/zed2i/camera_info',
+                                 self.camera_info_callback, 1)
+
+        # Aracın orta çizgisi ile SAĞDAKİ en yakın çizgi arasında korunacak
+        # mesafe (metre). Ekrandaki mavi çizgi = aracın ortası.
+        #
+        # ÖLÇÜLDÜ (2026-08-19): pist şeridi 3.0 m -> şeridin ortasında gitmek
+        # için sağ çizgiye 1.5 m. Kayıt bunu BAĞIMSIZ olarak doğruluyor:
+        # pist_20260819_104914'ün düz kesitinde ölçülen mesafe medyanı 1.57 m.
+        # Bir ara 1.1/1.2 denendi; o bir TAHMİNDİ ve iki yönden zararlıydı:
+        # aracı şerit ortasının 30-40 cm sağına oturtuyor, ayrıca
+        # hata = ölçülen - hedef büyüdüğü için SOL virajda "sağa kır" komutunu
+        # güçlendiriyordu (bkz. aşağıdaki viraj notu).
+        self.declare_parameter('hedef_sag_mesafe_m', 1.5)
+        # Hatanın -1..+1 sapmaya ölçeklenmesi: bu kadar metre hata = tam sapma.
+        # HATA -> SAPMA ÖLÇEĞİ. Kaç metre hata 'tam sapma' (1.0) sayılsın.
+        # DİKKAT: metrik moda geçerken sapmanın BİRİMİ değişti - eskiden 1.0
+        # görüntü yarı genişliği demekti, şimdi bu kadar METRE demek. Ölçek
+        # 1.0 iken kp=1.0 ile 0.5 m'lik hata direksiyonu TAVANA dayıyordu
+        # (0.5 rad ~ 29°); araç sert kırıp aşıyor ve şeritten çıkıyordu.
+        # 2.5 ile aynı hata ~11° veriyor - düzeltir ama savurmaz.
+        self.declare_parameter('mesafe_hata_olcegi_m', 2.5)
+        # Derinlik gürültülüdür; çizgi çevresinden bu yarıçapta medyan alınır.
+        self.declare_parameter('derinlik_pencere_px', 7)
+
+        # ŞERİT DEĞİŞTİRMEME KİLİDİ (metrik mod). Takip edilen sağ çizgi
+        # kaybolursa 'en yakın sağ çizgi' bir sonraki şeridin çizgisi olur ve
+        # ölçülen mesafe bir anda sıçrar; araç o çizgiyi 1.5 m'de tutmaya
+        # çalışıp ŞERİT DEĞİŞTİRİR. Gerçek bir yanal hareket bu kadar ani
+        # olamayacağı için, sıçrayan ölçüm kabul edilmez: ölçüm yok sayılır ve
+        # araç önceki şeridini korur.
+        self.declare_parameter('mesafe_sicrama_esigi_m', 0.8)
+
+        # /lane/valid NE ZAMAN False OLMALI. UART düğümü bu bayrağı görünce
+        # şerit takibini TAMAMEN bırakıp odometriyle düz gidiyor (kavşak
+        # davranışı). Metrik modda çizgi kısa süreli kaybolmak NORMAL - gerçek
+        # kayıtta satırların %85'inde tek çizgi var - ve her kısa kayıpta
+        # kontrolü bırakmak, hesaplanan 1.5 m komutunun araca hiç ulaşmaması
+        # demekti. Şerit ancak bu kadar kare üst üste ölçülemezse geçersiz
+        # sayılır; kavşakta çizgi gerçekten bittiği için eşik yine aşılır.
+        self.declare_parameter('gecerlilik_kayip_kare', 12)
+
+        # ÖLÇÜM SABİT İLERİ MESAFEDEN ALINIR. Eskiden 'veri veren ilk satır'
+        # kullanılıyordu; satırlar farklı ileri mesafelere denk geldiği ve
+        # virajda yanal mesafe ileri mesafeyle değiştiği için, hangi satırın
+        # veri verdiği değişince ÖLÇÜLEN MESAFE de zıplıyordu. Araç sabit
+        # olmayan bir hedefi kovalıyor, bu da şeritten kaymaya yol açıyordu.
+        # Derinlik sayesinde her noktanın Z'si bilindiği için, hep bu uzaklığa
+        # en yakın noktadan ölçmek karşılaştırılabilir bir değer verir.
+        self.declare_parameter('olcum_ileri_mesafe_m', 3.0)
 
         # --- ŞERİT TAKİBİ AYARLARI ---
         # Kamera aracın tam ortasında/tam ileri bakacak şekilde değilse şerit
         # ortası görüntü ortasına denk düşmez. Bu sabit kayma düz yolda sürekli
         # bir sapma üretip aracı kenara çekiyordu. Kalibrasyon: aracı şeridin
         # ortasına koy, ekrandaki "Merkez" değeri ile "ref" farkını buraya yaz.
-        self.declare_parameter('camera_center_offset_px',
-                               KAL('camera_center_offset_px', 0.0))
+        # 0.0: kayıt analizi de ~0 diyor. TEMİZ BİR ÖLÇÜM YAPILMADI - aracı
+        # şeridin ortasına düz koyup kalibrasyon_kamera.py ile ölçün, çıkan
+        # değeri buraya yazın.
+        self.declare_parameter('camera_center_offset_px', 0.0)
         # Sapmanın okunduğu satır (1.0 = görüntünün en altı). Yukarı çekmek daha
         # ileriye baktırır (yumuşak direksiyon), aşağı çekmek tepkiselleştirir.
         # 0.80 iken kaputun hemen üstüne, yani birkaç metre öteye bakıyordu ve
@@ -97,20 +170,78 @@ class LaneDetectionNode(Node):
         # (aynı virajda ölçüm: -0.093 -> -0.247), ikisi üst üste binince orta bir
         # virajda direksiyon tavana dayanıyordu. Toplam agresiflik eskisiyle
         # aynı kaldı, ama artık ağırlık sezgisel terimde değil GERÇEK geometride.
-        self.declare_parameter('curve_feedforward', 0.5)
+        # (Pistte 0.5 yerine 0.6 ile sürüldü; sabitlenen değer o.)
+        self.declare_parameter('curve_feedforward', 0.6)
         # Yaklaşık ufuk çizgisi (şerit genişliğinin perspektifle küçülme modeli)
-        self.declare_parameter('horizon_frac', 0.55)
+        # UFUK ÇİZGİSİ (kaybolma noktası). Şerit genişliğinin perspektifle
+        # küçülme modeli buna dayanır: genislik ~ (y - ufuk). Yanlışsa yakın
+        # satırlara UZATMA patlar. GERÇEK KAYITTAN ÖLÇÜLDÜ (pist_20260818_111612,
+        # test/kayit_analiz.py): y=460'ta 400 px, y=432'de 348 px çift ->
+        # ufuk y=245, yani 0.34. Kodda 0.55 yazıyordu ve o değerle y=576 için
+        # beklenen genişlik 1125 px (görüntü 1280 px!) çıkıyordu; tek çizgi
+        # görülen satırlarda merkez 'çizgi ± 562 px' diye kurulup bir şerit
+        # öteye fırlıyordu - aracın şerit değiştirmesinin sebebi buydu.
+        self.declare_parameter('horizon_frac', 0.512)
         # BEKLENEN ŞERİT GENİŞLİĞİ: 0.85 satırında görüntü genişliğinin kaçta kaçı.
         # Bulunan iki çizgi arasındaki mesafe bununla karşılaştırılıp mantıksızsa
         # reddediliyor - BARİYERLERİ ELEYEN TEK MEKANİZMA bu. Yanlışsa ya bariyer
         # çifti "şerit" sayılır, ya da gerçek şerit reddedilir.
         # ÖLÇÜM: debug_rows_log açıkken tablodaki 'gen' sütunu, y=0.85*yükseklik
         # satırında kaç piksel? Onu görüntü genişliğine bölün.
-        self.declare_parameter('lane_width_frac', KAL('lane_width_frac', 0.40))
+        # ✓ kayıttan doğrulandı (0.395)
+        self.declare_parameter('lane_width_frac', 0.40)
         # Şerit çizgisi noktalarını SÜRÜLEBİLİR ALANIN İÇİNDE olanlarla sınırla.
         # Bariyer/korkuluk alanın dışında kaldığı için bu filtre onları eler.
         # Kapatmak, modelin bulduğu her çizgiyi kabul etmek demektir.
         self.declare_parameter('paint_inside_only', True)
+        # YAN ŞERİDE KAYMAYI ÖNLEME. Sürülebilir alan yandaki kola bitişikse
+        # aralarında boşluk olmadığı için tek geniş parça görünür; koridorun
+        # orta noktası o kola doğru kayar ve araç "düz mü, yandaki şeride mi"
+        # arasında kararsız kalır. Ölçülen koridor, öğrenilen genişliğin bu
+        # katından genişse yan kol açılmış sayılır: genişlik korunur, rota
+        # sürekli kalan kenara sabitlenir. Mecburi dönüş varken (preferred_side)
+        # bu kilit BİLEREK devre dışı - dönüşte yan kola çıkmak gerekiyor.
+        self.declare_parameter('corridor_widen_tol', 1.35)
+        # Koridor parçası referanstan bu kadar uzaktaysa (görüntü genişliğinin
+        # oranı) o satır ölçülmez. Yolun yanındaki alakasız sürülebilir alana
+        # sıçramayı engeller - bkz. _corridor_centers_at_rows.
+        self.declare_parameter('corridor_max_jump_frac', 0.20)
+        # ROTA KARARLILIĞI. Satır merkezleri her karede sıfırdan ölçülüyor ve
+        # eğri onlara uyduruluyordu - hiçbir zamansal yumuşatma yoktu. Bir satır
+        # bir karede iki çizgiyi, sonraki karede tek çizgiyi görünce merkez
+        # (ölçülen orta) ile (çizgi ± genişlik/2) arasında sıçrıyor ve hedef
+        # rota sürekli değişiyordu. 0 = yumuşatma yok (eski davranış),
+        # 0.5 = yeni ölçüm yarı ağırlıkla karışır. Yükseltmek kararlılığı
+        # artırır ama viraja tepkiyi geciktirir.
+        self.declare_parameter('route_smoothing', 0.5)
+        # ŞERİT KİMLİĞİ KİLİDİ. İzlenen sol/sağ çizgi konumları sınırsız
+        # güncelleniyordu: kesikli çizgide ya da tek karelik yanlış eşleşmede
+        # iz yavaşça YAN ŞERİDİN çizgisine yürüyebiliyor, araç da şerit
+        # değiştiriyordu.
+        #
+        # Sınır ŞERİT GENİŞLİĞİNİN oranıdır, görüntü genişliğinin değil:
+        # engellenmek istenen şey "yan şeridin çizgisine atlamak" ve o çizgi
+        # tam bir şerit genişliği uzakta. Görüntü oranına bağlamak (0.04 =
+        # 51 px) arama penceresinin (102 px) yarısı kadar kalıyordu; araç
+        # hareket ederken iz geride kalıp yedek yola düşüyor, yani kilit
+        # tam da önlemek istediği hatayı tetikleyebiliyordu.
+        self.declare_parameter('max_line_jump_frac', 0.40)
+        # ŞERİT GENİŞLİĞİNİ KENDİ ÖĞREN. lane_width_frac elle ölçülmesi gereken
+        # bir tahmindi ve yanlış olduğunda aracın KENDİ şeridinin çizgi çifti
+        # "genişlik mantıksız" diye reddediliyor, merkez tek çizgiden yanlış
+        # kuruluyor ve araç yan şeride itiliyordu. Oysa doğru genişlik zaten
+        # her karede ölçülüyor: yeterli örnek birikince MEDYANI kullanmak,
+        # elle girilen tahminden hem daha doğru hem de bakım gerektirmez.
+        # (Medyan, arada karışan yanlış çiftlere karşı dayanıklıdır.)
+        self.declare_parameter('auto_lane_width', True)
+        self.declare_parameter('auto_lane_width_min_samples', 15)
+        # FİZİKSEL SINIRLAR (0.85 satırına normalize, görüntü genişliğinin oranı).
+        # Önyükleme sırasında mantıklılık kapısı kapalı olduğu için SAÇMA çiftler
+        # de öğrenilebiliyordu: gerçek kayıtta öğrenilen genişlik 1320 px çıktı -
+        # görüntü 1280 px, yani en soldaki çizgi en sağdakiyle eşleşmiş. Bir
+        # şerit görüntüden geniş olamaz; bu aralık dışındaki ölçüm hiç sayılmaz.
+        self.declare_parameter('lane_width_min_frac', 0.10)
+        self.declare_parameter('lane_width_max_frac', 0.70)
         # GÖRSELLEŞTİRME BÜTÇESİ. Debug karesi sadece insan için; kontrol yolunda
         # değil. Maskeleri tam çözünürlükte her karede basmak ölçümde ~145 ms
         # tutuyordu (maske ne kadar çok pikseli kaplarsa o kadar yavaş - yol
@@ -122,13 +253,15 @@ class LaneDetectionNode(Node):
         # kenarlarını çizgi sanıyor ve rota bariyerden türetiliyordu. Sürülebilir
         # alan maskesi ise yolu ve virajı net veriyor - zaten hesaplanıyordu ama
         # sadece görselleştirmede kullanılıyordu.
-        #   'yol'   = sürülebilir alanın koridor ortası (boyasız pist için)
-        #   'serit' = şerit çizgileri (boyalı yol için, eski davranış)
-        #   'auto'  = çizgiler sürülebilir alanın içindeyse 'serit', değilse 'yol'
-        # Varsayılan 'auto': pistte asfalta boya ÇİZİLMİŞ ve kenarda bariyer var.
-        # Boya sürülebilir alanın içinde, bariyer dışında kalır; ayırt edici bu.
-        # (Önceki varsayılan 'yol' idi, "boya yok" varsayımına dayanıyordu.)
-        self.declare_parameter('route_source', KAL('route_source', 'auto'))
+        #   'mesafe' = sağdaki çizgiyi METRİK mesafede tutar (hedef_sag_mesafe_m);
+        #              derinlik gerektirir, tek çizgi görünce de çalışır
+        #   'yol'    = sürülebilir alanın koridor ortası (boyasız pist için)
+        #   'serit'  = şerit çizgileri (boyalı yol için, eski davranış)
+        #   'auto'   = çizgiler sürülebilir alanın içindeyse 'serit', değilse 'yol'
+        # VARSAYILAN 'mesafe': pistte asfalta boya ÇİZİLMİŞ, kenarda bariyer var.
+        # Kayıt analizinde (7.6 dk, 1184 kare) rota kaynağı %100 şerit, şerit
+        # kaybı %1.3 - yani çizgiler tutarlı görülüyor, bariyere kaçmıyor.
+        self.declare_parameter('route_source', 'mesafe')
         # 'auto' için: kaç satırda İKİ çizgi de sürülebilir alanın içinde olmalı
         # (bkz. _looks_like_paint - bariyerler alanın dışında kalır)
         self.declare_parameter('min_paint_rows', 3)
@@ -136,11 +269,12 @@ class LaneDetectionNode(Node):
         # sayıyor (ekranda kaput da yeşil), ayrıca eski örnekleme satırlarının en
         # alt üçü (0.95/0.90/0.85) doğrudan gövdenin üstüne düşüyordu.
         # Kalibrasyon: debug karesinde kaputun üst kenarı görüntünün yüzde kaçında?
-        self.declare_parameter('hood_frac', KAL('hood_frac', 0.82))
+        # ✓ kayıttan doğrulandı (0.832)
+        self.declare_parameter('hood_frac', 0.82)
         # TANI: her örnekleme satırındaki koridor kenarlarını ve merkezini loglar.
         # Rota yamuk çıktığında hangi satırın bozulduğu ancak böyle görülüyor -
         # ekrandaki tek "Merkez" sayısı sorunun nerede başladığını söylemiyor.
-        self.declare_parameter('debug_rows_log', False)
+        self.declare_parameter('debug_rows_log', True)
 
         self.camera_center_offset_px = float(self.get_parameter('camera_center_offset_px').value)
         self.look_ahead_frac = float(self.get_parameter('look_ahead_frac').value)
@@ -150,6 +284,20 @@ class LaneDetectionNode(Node):
         self.horizon_frac = float(self.get_parameter('horizon_frac').value)
         self.lane_width_frac = float(self.get_parameter('lane_width_frac').value)
         self.paint_inside_only = bool(self.get_parameter('paint_inside_only').value)
+        self.corridor_widen_tol = float(self.get_parameter('corridor_widen_tol').value)
+        self.corridor_max_jump_frac = float(self.get_parameter('corridor_max_jump_frac').value)
+        self.route_smoothing = float(self.get_parameter('route_smoothing').value)
+        self.hedef_sag_mesafe_m = float(self.get_parameter('hedef_sag_mesafe_m').value)
+        self.mesafe_hata_olcegi_m = float(self.get_parameter('mesafe_hata_olcegi_m').value)
+        self.derinlik_pencere_px = int(self.get_parameter('derinlik_pencere_px').value)
+        self.mesafe_sicrama_esigi_m = float(self.get_parameter('mesafe_sicrama_esigi_m').value)
+        self.gecerlilik_kayip_kare = int(self.get_parameter('gecerlilik_kayip_kare').value)
+        self.olcum_ileri_mesafe_m = float(self.get_parameter('olcum_ileri_mesafe_m').value)
+        self.max_line_jump_frac = float(self.get_parameter('max_line_jump_frac').value)
+        self.auto_lane_width = bool(self.get_parameter('auto_lane_width').value)
+        self.auto_lane_width_min = int(self.get_parameter('auto_lane_width_min_samples').value)
+        self.lane_width_min_frac = float(self.get_parameter('lane_width_min_frac').value)
+        self.lane_width_max_frac = float(self.get_parameter('lane_width_max_frac').value)
         self.debug_every_n = int(self.get_parameter('debug_every_n').value)
         self.debug_scale = float(self.get_parameter('debug_scale').value)
         self.route_source = str(self.get_parameter('route_source').value)
@@ -182,6 +330,37 @@ class LaneDetectionNode(Node):
         # virajda şerit eğik durduğu için aynı satırdaki iki çizginin yatay
         # mesafesi gerçek genişlikten büyüktür (bkz. _slant_factor).
         self.lane_width_track = [None] * len(self.sample_rows)
+        # Satır başına KAREDEN KAREYE takip edilen sol/sağ çizgi konumu. Sadece
+        # lane_center_track (kayan ORTA nokta) yeterli değil: iki şerit yan
+        # yanayken merkez, iki koridor arasındaki sınırın etrafında dolanabilir
+        # ve o anda hangi çizgilerin gerçekten TAKİP EDİLEN şeride ait olduğunu
+        # söylemez - sistem kare kare farklı şeride "kayabiliyordu". Bu iz,
+        # önceki karede kilitlenen fiziksel çizgiye yakınlığı tercih ettirip
+        # araç zaten hangi şeritteyse onda kalmasını sağlar.
+        self.left_line_track = [None] * len(self.sample_rows)
+        self.right_line_track = [None] * len(self.sample_rows)
+        # Satır merkezinin ZAMANSAL izi + o satırın en son hangi karede
+        # ölçüldüğü. Bayat bir izle karıştırmak (satır birkaç kare hiç
+        # görülmediyse) sıçramayı azaltmaz, geciktirir - o yüzden tazelik
+        # şartı var (bkz. _smooth_row_center).
+        self.row_meas_track = [None] * len(self.sample_rows)
+        self.row_meas_frame = [-999] * len(self.sample_rows)
+        # KALİBRASYON İÇİN ham genişlik: en yakın satırda bulunan çift, MANTIKLILIK
+        # KONTROLÜNDEN ÖNCEKİ hâliyle. Öğrenilen genişlik (lane_width_track) ancak
+        # çift kabul edilirse doluyor; lane_width_frac yanlışken çift zaten
+        # reddedildiği için kalibrasyon hiç veri göremiyordu (kısırdöngü).
+        self.raw_width_meas = None
+        self.debug_points = []
+        self.son_mesafe_m = None
+        # Ölçülen şerit genişliği örnekleri, 0.85 satırına NORMALİZE edilmiş
+        # (perspektifte genişlik ufka uzaklıkla değişir; normalize etmeden
+        # farklı satırların ölçümleri kıyaslanamaz). Medyanı beklenen
+        # genişliği verir - bkz. _expected_lane_width.
+        self.width_samples = collections.deque(maxlen=120)
+        # 'auto' kaynak seçiminin oy sayacı (bkz. _route_centers histerezisi).
+        # Negatif = koridor ('yol'), pozitif = şerit çizgisi ('serit').
+        self.paint_votes = 0
+        self.source_switch_frames = 5
         self.lost_frames = 0
         self.lane_valid = False
         self.lane_slope = None   # önceki karenin şerit eğimi (dx/dy), eğiklik düzeltmesi için
@@ -223,7 +402,14 @@ class LaneDetectionNode(Node):
                    'max_deviation_rate', 'curve_feedforward', 'horizon_frac',
                    'debug_every_n', 'debug_scale', 'min_paint_rows', 'hood_frac',
                    'route_source', 'debug_rows_log', 'lane_width_frac',
-                   'paint_inside_only')
+                   'paint_inside_only', 'corridor_widen_tol',
+                   'corridor_max_jump_frac', 'route_smoothing',
+                   'max_line_jump_frac', 'auto_lane_width',
+                   'lane_width_min_frac', 'lane_width_max_frac',
+                   'hedef_sag_mesafe_m', 'mesafe_hata_olcegi_m',
+                   'derinlik_pencere_px',
+                   'mesafe_sicrama_esigi_m', 'gecerlilik_kayip_kare',
+                   'olcum_ileri_mesafe_m')
 
     def preferred_side_callback(self, msg):
         """Kavşakta tercih edilen kol (-1 sol, 0 yok, +1 sağ)."""
@@ -347,8 +533,12 @@ class LaneDetectionNode(Node):
             dj = max(self.sample_rows[j] * height - horizon, 1.0)
             return self.lane_width_track[j] * di / dj
 
-        # Hiç ölçüm yoksa: 0.85 satırında görüntünün lane_width_frac kadarı
-        return width * self.lane_width_frac * di / max(0.85 * height - horizon, 1.0)
+        # Öğrenilmiş satır yoksa: ÖLÇÜLEN genişliklerin medyanı (auto). Elle
+        # girilen lane_width_frac yalnızca henüz yeterli örnek yokken kullanılır.
+        ref_di = max(0.85 * height - horizon, 1.0)
+        if self.auto_lane_width and len(self.width_samples) >= self.auto_lane_width_min:
+            return float(np.median(self.width_samples)) * di / ref_di
+        return width * self.lane_width_frac * di / ref_di
 
     def _slant_factor(self, y):
         """Şerit eğikken aynı satırdaki yatay genişlik, dik genişlikten büyüktür.
@@ -392,6 +582,36 @@ class LaneDetectionNode(Node):
                 kalan.append(x)
         return kalan
 
+    @staticmethod
+    def _kirp(onceki, yeni, sinir):
+        """İzi en fazla 'sinir' kadar kaydırır (ilk karede serbest)."""
+        if onceki is None:
+            return yeni
+        fark = yeni - onceki
+        if abs(fark) > sinir:
+            return onceki + (sinir if fark > 0 else -sinir)
+        return yeni
+
+    def _smooth_row_center(self, index, center):
+        """Satır merkezini zamansal olarak yumuşatır (rota kararlılığı).
+
+        Ölçüm gürültüsü doğrudan eğriye, oradan da direksiyona geçiyordu.
+        Özellikle bir satır bir karede iki çizgiyi, sonrakinde tek çizgiyi
+        gördüğünde merkez iki farklı tahmin arasında sıçrıyor.
+
+        BAYAT İZLE KARIŞTIRMA: satır birkaç karedir hiç ölçülmediyse eski
+        değer artık o satırı temsil etmiyor; karıştırmak sıçramayı önlemez,
+        sadece geciktirir. O yüzden iz yalnızca TAZEyse kullanılır.
+        """
+        onceki = self.row_meas_track[index]
+        taze = (self.frame_count - self.row_meas_frame[index]) <= 2
+        if onceki is not None and taze and self.route_smoothing > 0.0:
+            center = (self.route_smoothing * onceki
+                      + (1.0 - self.route_smoothing) * center)
+        self.row_meas_track[index] = center
+        self.row_meas_frame[index] = self.frame_count
+        return center
+
     def _lane_centers_at_rows(self, lane_mask, da_mask=None):
         """Örnekleme satırlarının her birinde ego şeridin merkezini bulur.
 
@@ -411,6 +631,8 @@ class LaneDetectionNode(Node):
 
         ys, centers = [], []
         self.debug_rows = []
+        self.debug_points = []
+        self.raw_width_meas = None
 
         prev_left = prev_right = prev_y = None
         slope_left = slope_right = 0.0    # satırlar arası dx/dy tahmini
@@ -424,6 +646,7 @@ class LaneDetectionNode(Node):
                                                max(3, int(width * 0.006)))
             if not points:
                 continue
+            self.debug_points.append((y, list(points)))
 
             # Şerit eğikse yatay ölçümü dik genişliğe çevirmek için katsayı
             slant = self._slant_factor(y)
@@ -432,8 +655,20 @@ class LaneDetectionNode(Node):
             if prev_y is None:
                 # ARACA EN YAKIN GEÇERLİ SATIR: burada takip merkezi güvenilir
                 reference = self.lane_center_track[i]
-                left = max([x for x in points if x < reference - min_half], default=None)
-                right = min([x for x in points if x > reference + min_half], default=None)
+                tracked_left, tracked_right = self.left_line_track[i], self.right_line_track[i]
+                left = right = None
+                if tracked_left is not None and tracked_right is not None:
+                    # ÖNCE önceki karede kilitlenen FİZİKSEL çizgilere yakınlığa
+                    # bak: iki şerit yan yanayken kayan merkez (reference) iki
+                    # koridor arasındaki sınırın etrafında dolanabilir ve hangi
+                    # çizgilerin TAKİP EDİLEN şeride ait olduğunu söylemez - bu
+                    # da kare kare farklı şeride kaymaya yol açıyordu.
+                    left = self._nearest(points, tracked_left, window)
+                    right = self._nearest(points, tracked_right, window)
+                if left is None:
+                    left = max([x for x in points if x < reference - min_half], default=None)
+                if right is None:
+                    right = min([x for x in points if x > reference + min_half], default=None)
             else:
                 # ÜST SATIRLAR: çizgileri alttaki konumlarından + eğimden tahmin et
                 dy = y - prev_y
@@ -450,7 +685,31 @@ class LaneDetectionNode(Node):
             center = None
             if left is not None and right is not None:
                 measured = (right - left) / slant   # dik genişliğe çevir
-                if 0.5 * expected < measured < 1.8 * expected:
+                if i == 0 or self.raw_width_meas is None:
+                    # Kalibrasyon bunu okur; kontrol yolunu etkilemez.
+                    self.raw_width_meas = measured
+                # 0.85 satırına normalize edip örnek havuzuna at (auto genişlik).
+                # FİZİKSEL SINIR: bu aralığın dışı bir şerit olamaz (en soldaki
+                # çizgiyi en sağdakiyle eşleştirmiş demektir); öğrenmeye sokmak
+                # beklenen genişliği bozar ve merkezi kadraj dışına atar.
+                horizon = self.horizon_frac * height
+                di = max(self.sample_rows[i] * height - horizon, 1.0)
+                ref_di = max(0.85 * height - horizon, 1.0)
+                norm = measured * ref_di / di
+                fiziksel = (self.lane_width_min_frac * width <= norm
+                            <= self.lane_width_max_frac * width)
+                if fiziksel:
+                    self.width_samples.append(norm)
+                # ÖNYÜKLEME: genişlik daha ölçülmediyse mantıklılık kapısı
+                # DOĞRULANMAMIŞ bir tahmine dayanır ve doğru çifti eleyebilir
+                # (ölçümde: gerçek 122 px çift, 426 px beklendiği için
+                # reddediliyor; merkez tek çizgiden 792 px'e kuruluyordu).
+                # Araç başlangıçta şeridinin ortasında olduğu için en yakın
+                # sol/sağ çift zaten DOĞRU çifttir - önce onu ölçelim, kapıyı
+                # ondan sonra uygulayalım.
+                onyukleme = (self.auto_lane_width
+                             and len(self.width_samples) < self.auto_lane_width_min)
+                if (onyukleme and fiziksel) or 0.5 * expected < measured < 1.8 * expected:
                     center = (left + right) / 2.0
                     previous = self.lane_width_track[i]
                     self.lane_width_track[i] = (
@@ -478,6 +737,8 @@ class LaneDetectionNode(Node):
             if center is None:
                 continue
 
+            center = self._smooth_row_center(i, center)
+
             # Görülmeyen çizginin yerini de doldur ki takip penceresi kesikli
             # çizgide/kadraj dışına çıkan çizgide yukarı doğru kaymaya devam etsin
             filled_left = left if left is not None else center - known / 2.0
@@ -488,6 +749,11 @@ class LaneDetectionNode(Node):
                     slope_left = 0.5 * slope_left + 0.5 * (filled_left - prev_left) / dy
                     slope_right = 0.5 * slope_right + 0.5 * (filled_right - prev_right) / dy
             prev_left, prev_right, prev_y = filled_left, filled_right, y
+            # İzi kare başına sınırlı kaydır: yan şeridin çizgisine yürümesin.
+            # 'known' o satırdaki şerit genişliği (öğrenilmiş ya da beklenen).
+            sinir = self.max_line_jump_frac * known
+            self.left_line_track[i] = self._kirp(self.left_line_track[i], filled_left, sinir)
+            self.right_line_track[i] = self._kirp(self.right_line_track[i], filled_right, sinir)
 
             ys.append(float(y))
             centers.append(center)
@@ -549,8 +815,17 @@ class LaneDetectionNode(Node):
             else:
                 chosen = next((g for g in groups if g[0] <= reference <= g[-1]), None)
                 if chosen is None:
+                    # Hiçbir parça referansı içermiyor. En yakınına atlamak
+                    # SINIRSIZ olamaz: yolun yanındaki bambaşka bir sürülebilir
+                    # parça (servis yolu, açık alan) referanstan çok uzakta da
+                    # olsa "en yakın" olabiliyor ve rota şerit bile olmayan bir
+                    # yere kuruluyordu. Uzaksa bu satırı ÖLÇME - eksik satır,
+                    # yanlış satırdan iyidir (kalan satırlar rotayı yine kurar).
                     chosen = min(groups, key=lambda g: min(abs(g[0] - reference),
                                                            abs(g[-1] - reference)))
+                    uzaklik = min(abs(chosen[0] - reference), abs(chosen[-1] - reference))
+                    if uzaklik > self.corridor_max_jump_frac * width:
+                        continue
 
             left, right = float(chosen[0]), float(chosen[-1])
             # Kadraj dışına çıkan kenar: koridor gerçekte daha geniş, orta nokta
@@ -567,6 +842,20 @@ class LaneDetectionNode(Node):
                 center = right - known / 2.0
             elif right_clipped and known is not None:
                 center = left + known / 2.0
+            elif (known is not None and not self.preferred_side
+                  and (right - left) > self.corridor_widen_tol * known):
+                # YAN KOL AÇILDI. Sürülebilir alan yandaki şeride bitişik
+                # olduğu için groups bunu ayıramaz (aralarında boşluk yok);
+                # orta noktayı almak aracı o kola çeker. Takip edilen şeridin
+                # ÖĞRENİLMİŞ genişliğini koru ve SÜREKLİ kalan kenara sabitle:
+                # yan kol hangi taraftaysa o kenar referanstan uzağa sıçrar,
+                # diğeri yerinde kalır. Böylece araç düz şeridinde kalır.
+                # (Mecburi dönüş varsa bu dal atlanır - bkz. preferred_side.)
+                if abs(left - (reference - known / 2.0)) <= abs(right - (reference + known / 2.0)):
+                    center = left + known / 2.0
+                else:
+                    center = right - known / 2.0
+                # Genişliği ÖĞRENME: bu ölçüm şeridin değil, birleşik alanın.
             else:
                 # Buraya iki kenar da kadraj içindeyken gelinir; ya da bir kenar
                 # kesikken henüz öğrenilmiş genişlik yokken (o durumda orta nokta
@@ -578,6 +867,7 @@ class LaneDetectionNode(Node):
                         measured if known is None else 0.85 * known + 0.15 * measured
                     )
 
+            center = self._smooth_row_center(i, center)
             prev_center = center
             ys.append(float(y))
             centers.append(center)
@@ -617,13 +907,160 @@ class LaneDetectionNode(Node):
 
         return inside_rows >= self.min_paint_rows
 
+    def _mesafe_sapmasi(self, lane_mask):
+        """Sağ çizgiye olan metrik mesafeyi hedefle kıyaslayıp sapma üretir."""
+        height, width = lane_mask.shape
+        olcum = self._sag_cizgi_mesafesi(lane_mask)
+
+        if olcum is None:
+            # ÇİZGİ KAYBOLDU. Viraj algılama KALDIRILDI (2026-08-19): tek kural
+            # 'sağdaki çizgiyle hedef mesafeyi koru'. Çizgi yokken uydurulacak
+            # bir komut da yok - son komut sönümlenerek sürer.
+            self.lost_frames += 1
+            self.debug_fit = None
+            self.debug_center = None
+            self.debug_curve = 0.0
+            self.son_mesafe_m = None
+
+            # Kısa kayıpta kontrolü BIRAKMA: eski komut sönümlenerek sürer.
+            self.lane_valid = self.lost_frames <= self.gecerlilik_kayip_kare
+
+            self.debug_source = 'mesafe-yok'
+            son = self.deviation_history[-1] if self.deviation_history else 0.0
+            sonuc = son * 0.85
+            self._push_history(sonuc)
+            return float(sonuc)
+
+        mesafe, u, v = olcum
+
+        # ŞERİT DEĞİŞTİRMEME KİLİDİ: takip edilen çizgi kaybolduğunda 'en yakın
+        # sağ çizgi' yan şeridin çizgisi olur ve mesafe bir anda sıçrar. Gerçek
+        # yanal hareket bu kadar ani olamaz; sıçrayan ölçümü KABUL ETME, araç
+        # kendi şeridinde kalsın. (Ölçüm yokmuş gibi davranılır: sapma sönümlenir.)
+        onceki = self.son_mesafe_m
+        if (onceki is not None
+                and abs(mesafe - onceki) > self.mesafe_sicrama_esigi_m):
+            self.lost_frames += 1
+            self.debug_source = 'mesafe-sicrama'
+            # Bilerek eski şeridi koruyoruz: bu bir KARAR, kontrol kaybı değil.
+            self.lane_valid = self.lost_frames <= self.gecerlilik_kayip_kare
+            # son_mesafe_m KORUNUR: hedefimiz hâlâ eski çizgi.
+            son = self.deviation_history[-1] if self.deviation_history else 0.0
+            sonuc = son * 0.85
+            self._push_history(sonuc)
+            return float(sonuc)
+
+        self.lost_frames = 0
+        self.lane_valid = True
+        self.debug_source = 'mesafe'
+        self.son_mesafe_m = mesafe
+        self.debug_center = (int(u), int(v))
+        self.debug_fit = None
+        self.debug_curve = 0.0
+
+        # Hedeften SAPMA. mesafe > hedef ise çizgi olması gerekenden uzakta,
+        # yani araç fazla SOLDA -> sağa kırmalı (pozitif sapma sağa kırdırır).
+        # TEK KURAL: sağdaki en yakın çizgiyle aramızda hep hedef mesafe kalsın.
+        # Viraj için AYRI bir yanlılık EKLENMEZ - çizgi virajda kavis yaptığı
+        # için 1.5 m'yi korumak aracı zaten virajdan geçirir. Üstüne yanlılık
+        # eklemek bu kuralla çekişir ve şeritten kaydırırdı.
+        hata = mesafe - self.hedef_sag_mesafe_m
+        sapma = hata / max(self.mesafe_hata_olcegi_m, 1e-3)
+        return self._yumusat_ve_sinirla(float(np.clip(sapma, -1.0, 1.0)))
+
+    def depth_callback(self, msg):
+        self.depth_image = self.br.imgmsg_to_cv2(msg, desired_encoding='32FC1')
+
+    def camera_info_callback(self, msg):
+        self.fx = float(msg.k[0])
+        self.cx = float(msg.k[2])
+
+    def _derinlik_oku(self, u, v):
+        """(u,v) çevresindeki geçerli derinliklerin medyanı (metre), yoksa None.
+
+        Tek piksel okumak güvenilmez: stereo derinlikte delikler (nan/inf) ve
+        kenar gürültüsü var. Çizginin kendisi yüksek kontrastlı olduğu için
+        çevresindeki küçük pencerede genelde yeterli geçerli ölçüm bulunur.
+        """
+        d = self.depth_image
+        if d is None:
+            return None
+        r = self.derinlik_pencere_px
+        y0, y1 = max(0, v - r), min(d.shape[0], v + r + 1)
+        x0, x1 = max(0, u - r), min(d.shape[1], u + r + 1)
+        parca = d[y0:y1, x0:x1]
+        gecerli = parca[np.isfinite(parca) & (parca > 0.1) & (parca < 40.0)]
+        if gecerli.size < 3:
+            return None
+        return float(np.median(gecerli))
+
+    def _sag_cizgi_mesafesi(self, lane_mask):
+        """Araç orta çizgisinin SAĞINDAKİ en yakın çizgiye METRİK uzaklık.
+
+        Dönen: (mesafe_m, u, v) ya da None.
+
+        Yanal uzaklık pinhole modelinden: X = (u - u_arac) * Z / fx.
+        u_arac aracın orta çizgisi (ekrandaki mavi çizgi), Z o pikseldeki
+        ZED derinliği. Perspektif/ufuk varsayımı YOK - ölçülen mesafe bu.
+        """
+        if self.fx is None or self.depth_image is None:
+            return None
+        height, width = lane_mask.shape
+        band = max(2, int(height * 0.006))
+        merge_gap = max(4, int(width * 0.012))
+        max_cluster_px = int(width * 0.25)
+        u_arac = width / 2.0 + self.camera_center_offset_px
+
+        # Tüm satırlardan ölç, sonra HEDEF İLERİ MESAFEYE en yakın olanı seç.
+        # 'İlk veri veren satır' yaklaşımı, satır değiştikçe ölçümü zıplatıyordu.
+        adaylar = []
+        for frac in self.sample_rows:
+            v = int(height * frac)
+            noktalar = self._row_lane_points(lane_mask, v, band, merge_gap,
+                                             max_cluster_px)
+            sagdakiler = [x for x in noktalar if x > u_arac]
+            if not sagdakiler:
+                continue
+            u = int(min(sagdakiler))          # en yakın SAĞ çizgi
+            z = self._derinlik_oku(u, v)
+            if z is None:
+                continue
+            adaylar.append(((u - u_arac) * z / self.fx, z, u, v))
+
+        if not adaylar:
+            return None
+
+        # HEDEF MESAFEDEKİ DEĞERİ ARA DEĞERLEMEYLE bul. 'En yakın noktayı seç'
+        # yetmiyor: o mesafede hiç nokta yoksa ölçüm yine zıplıyor. Noktalara
+        # doğru uydurup hedef Z'de değerlendirmek, hangi satırların veri
+        # verdiğinden BAĞIMSIZ ve karşılaştırılabilir bir mesafe üretir.
+        hedef_z = self.olcum_ileri_mesafe_m
+        en_yakin = min(adaylar, key=lambda p: abs(p[1] - hedef_z))
+        if len(adaylar) >= 2:
+            X = np.array([p[0] for p in adaylar])
+            Z = np.array([p[1] for p in adaylar])
+            if Z.max() - Z.min() > 0.3:
+                m, c = np.polyfit(Z, X, 1)
+                # Ölçüm aralığının dışına taşma: uzağa uzatmak güvenilmez
+                z_kirp = float(np.clip(hedef_z, Z.min(), Z.max()))
+                return float(m * z_kirp + c), en_yakin[2], en_yakin[3]
+        return en_yakin[0], en_yakin[2], en_yakin[3]
+
     def _route_centers(self, lane_mask, da_mask):
         """Rota noktalarını seçilen kaynaktan üretir (bkz. route_source parametresi)."""
         if self.route_source in ('serit', 'auto'):
             ys, centers = self._lane_centers_at_rows(lane_mask, da_mask)
             if self.route_source == 'serit':
                 return ys, centers, 'serit'
+            # HİSTEREZİS: 'auto'da kaynak kare kare değişirse rota merkezi iki
+            # farklı yerden kurulur, sapma işaret değiştirir ve direksiyon
+            # sağa-sola savrulur - yani kararsızlığı çözmek yerine üretir.
+            # Karar ancak ARKA ARKAYA aynı sonucu veren kareler sonrası döner.
             if self._looks_like_paint(lane_mask, da_mask):
+                self.paint_votes = min(self.paint_votes + 1, self.source_switch_frames)
+            else:
+                self.paint_votes = max(self.paint_votes - 1, -self.source_switch_frames)
+            if self.paint_votes >= self.source_switch_frames:
                 return ys, centers, 'serit'
 
         ys, centers = self._corridor_centers_at_rows(da_mask)
@@ -643,6 +1080,14 @@ class LaneDetectionNode(Node):
         Pozitif = rota merkezi aracın sağında, yani araç rotanın solunda.
         """
         height, width = lane_mask.shape
+
+        # METRİK MOD: aracın orta çizgisi ile sağdaki çizgi arasındaki GERÇEK
+        # mesafeyi hedefte tutar. Şerit ortası hesabına, şerit genişliğine,
+        # ufuk kalibrasyonuna ihtiyaç duymaz - gerçek kayıtta bunların hepsi
+        # kararsızdı (satırların %85'inde tek çizgi görülüyor).
+        if self.route_source == 'mesafe':
+            return self._mesafe_sapmasi(lane_mask)
+
         center_ref = width / 2.0 + self.camera_center_offset_px
 
         if self.lane_center_track is None:
@@ -661,6 +1106,10 @@ class LaneDetectionNode(Node):
                 self.lane_center_track = [center_ref] * len(self.sample_rows)
                 self.lane_width_track = [None] * len(self.sample_rows)
                 self.corridor_width_track = [None] * len(self.sample_rows)
+                self.left_line_track = [None] * len(self.sample_rows)
+                self.right_line_track = [None] * len(self.sample_rows)
+                self.row_meas_track = [None] * len(self.sample_rows)
+                self.row_meas_frame = [-999] * len(self.sample_rows)
             last = self.deviation_history[-1] if self.deviation_history else 0.0
             decayed = last * 0.85
             self._push_history(decayed)
@@ -721,6 +1170,10 @@ class LaneDetectionNode(Node):
 
         deviation = float(np.clip(cross_track + self.curve_feedforward * curve_term, -1.0, 1.0))
 
+        return self._yumusat_ve_sinirla(deviation)
+
+    def _yumusat_ve_sinirla(self, deviation):
+        """Hız sınırı + ağırlıklı ortalama + ölü bant. Her rota kaynağı kullanır."""
         # Tek karelik yanlış eşleşme direksiyonu bir anda kilitlemesin. Sınır
         # saniye bazlı: düşük FPS'te kare başına sınır viraja girişi geciktiriyordu.
         now = time.monotonic()
@@ -765,8 +1218,17 @@ class LaneDetectionNode(Node):
                 f'sag={sag if sag is None else int(sag):>4} '
                 f'gen={genislik:5.0f} mrk={int(merkez):>4} '
                 f'({merkez - ref:+5.0f})')
+        adaylar = {y: pts for y, pts in getattr(self, 'debug_points', [])}
+        for k, (y, sol, sag, merkez) in enumerate(self.debug_rows):
+            pts = adaylar.get(y)
+            if pts is not None:
+                satirlar[k] += '  adaylar=[' + ' '.join(f'{int(x)}' for x in pts) + ']'
+        genislikler = list(self.width_samples)
+        ozet = ('-' if not genislikler
+                else f'{float(np.median(genislikler)):.0f}px (n={len(genislikler)})')
         self.get_logger().info(
-            f'TANI (ref={ref:.0f}, kaynak={self.debug_source}, viraj={self.debug_curve:+.3f})\n  '
+            f'TANI (ref={ref:.0f}, kaynak={self.debug_source}, '
+            f'viraj={self.debug_curve:+.3f}, ogrenilen_genislik={ozet})\n  '
             + '\n  '.join(satirlar))
 
     def _push_history(self, value):
@@ -801,6 +1263,18 @@ class LaneDetectionNode(Node):
 
         # Mavi = aracın referans merkezi (kamera kayması dahil)
         cv2.line(im0, (center_ref, int(height * 0.6)), (center_ref, height), (255, 0, 0), 2)
+
+        # METRİK MODDA sadece iki şey çizilir: aracın orta çizgisi (mavi) ve
+        # ölçüm alınan sağ çizgi noktası. Şerit ortası/eğri/satır işaretçileri
+        # bu modda kullanılmıyor; ekranda tutmak yanıltıcı olur.
+        if self.route_source == 'mesafe':
+            if self.debug_center is not None:
+                u = int(self.debug_center[0] * scale)
+                v = int(self.debug_center[1] * scale)
+                cv2.drawMarker(im0, (u, v), (0, 255, 255), cv2.MARKER_TILTED_CROSS,
+                               max(12, int(24 * scale)), 2)
+                cv2.line(im0, (center_ref, v), (u, v), (0, 255, 255), 2)
+            return
 
         # Sol çizgi işaretçisi MOR: eskiden kırmızıydı, ama şerit maskesi de
         # kırmızı olduğu için işaretçi maskenin içinde kayboluyordu - ekranda
@@ -844,12 +1318,20 @@ class LaneDetectionNode(Node):
 
         center_ref = int(width / 2 + self.camera_center_offset_px)
         lane_center_px = self.debug_center[0] if self.debug_center else -1
-        debug_text = (f'LatDev: {lateral_deviation:+.3f} | '
-                      f'Viraj: {self.debug_curve:+.3f} | '
-                      f'Merkez: {lane_center_px} / ref {center_ref} | '
-                      f'Kaynak: {self.debug_source} | '
-                      f'FPS: {self.fps:.1f} | '
-                      f'Int: {intersection_direction}')
+        if self.route_source == 'mesafe':
+            m = getattr(self, 'son_mesafe_m', None)
+            debug_text = (f'LatDev: {lateral_deviation:+.3f} | '
+                          f'Sag cizgi: {"--" if m is None else f"{m:.2f}"} m '
+                          f'(hedef {self.hedef_sag_mesafe_m:.2f} m) | '
+                          f'Kaynak: {self.debug_source} | '
+                          f'FPS: {self.fps:.1f}')
+        else:
+            debug_text = (f'LatDev: {lateral_deviation:+.3f} | '
+                          f'Viraj: {self.debug_curve:+.3f} | '
+                          f'Merkez: {lane_center_px} / ref {center_ref} | '
+                          f'Kaynak: {self.debug_source} | '
+                          f'FPS: {self.fps:.1f} | '
+                          f'Int: {intersection_direction}')
         cv2.putText(view, debug_text, (10, max(20, int(40 * s))), cv2.FONT_HERSHEY_SIMPLEX,
                     max(0.45, 0.8 * s), (0, 255, 0), max(1, int(round(2 * s))))
 
@@ -981,6 +1463,12 @@ class LaneDetectionNode(Node):
             if self.debug_center is not None:
                 self.center_px_pub.publish(Float32(data=float(self.debug_center[0])))
             self.lane_valid_pub.publish(Bool(data=bool(self.lane_valid)))
+            self.curve_pub.publish(Float32(data=float(self.debug_curve)))
+            ham = self.raw_width_meas
+            if ham is None and self.lane_width_track[0] is not None:
+                ham = self.lane_width_track[0]
+            if ham is not None:
+                self.width_px_pub.publish(Float32(data=float(ham)))
 
             if self.debug_rows_log and self.frame_count % 15 == 0:
                 self._satir_tanisi(ll_seg_mask.shape[1])

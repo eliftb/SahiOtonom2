@@ -1,7 +1,4 @@
 #!/usr/bin/env python3
-import os
-import sys
-
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import ExternalShutdownException
@@ -9,13 +6,6 @@ from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool, Float32
 from rcl_interfaces.msg import SetParametersResult
 import numpy as np
-
-# Kalıcı kalibrasyon değerleri proje kökündeki kalibrasyon.yaml'dan gelir.
-# Bu düğüm alt klasörde olduğu için kök dizin arama yoluna ekleniyor.
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from kalibrasyon import kalibrasyon
-
-KAL = kalibrasyon('lidar_obstacle_detector')
 
 
 class LidarObstacleDetector(Node):
@@ -39,12 +29,13 @@ class LidarObstacleDetector(Node):
         # edilirse 0, ters monte edilirse 180. Montajdan sonra kalibre edin:
         # debug_nearest'i açın, aracın tam önüne bir kutu koyun ve loglarda
         # görünen açıyı buraya yazın.
-        self.declare_parameter('forward_angle_deg', KAL('forward_angle_deg', 0.0))
+        # (LiDAR daha monte edilmedi - bu değer ÖLÇÜLMEDİ.)
+        self.declare_parameter('forward_angle_deg', 0.0)
 
         # --- KORİDOR --------------------------------------------------------
         # Aracın geçeceği şeridin yarı genişliği. Araç genişliğinin yarısı +
         # güvenlik payı. Büyütmek yan bariyerleri engel saymaya başlar.
-        self.declare_parameter('corridor_half_width_m', KAL('corridor_half_width_m', 0.5))
+        self.declare_parameter('corridor_half_width_m', 0.5)
         # Bu mesafeden yakındaki ölçümler aracın kendi gövdesi/tamponu sayılır
         self.declare_parameter('min_check_distance_m', 0.15)
 

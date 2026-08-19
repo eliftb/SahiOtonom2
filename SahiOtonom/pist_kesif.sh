@@ -88,7 +88,7 @@ echo "-> Kayit basliyor..."
 ros2 bag record -o "$KLASOR/$AD" \
     --max-bag-size 2000000000 \
     --compression-mode file --compression-format zstd \
-    /zed2i_rgb/image_raw /zed2i/odom &
+    /zed2i_rgb/image_raw /zed2i/odom /zed2i/depth /zed2i/camera_info &
 PIDLER+=($!)
 
 echo

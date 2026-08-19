@@ -11,14 +11,14 @@ KULLANIM:
   2) ARACI ŞERİDİN TAM ORTASINA park et, düz bir yerde, şerit/yol net görünsün
   3) Bu aracı çalıştır:          python3 kalibrasyon_kamera.py --kaydet
 
-  Birkaç saniye bekleyip CTRL+C. Değer kalibrasyon.yaml'a yazılır.
+  Birkaç saniye bekleyip CTRL+C. Ölçülen değer ekrana basılır; artık otomatik
+  kaydedilmez - araç hangi dosyada hangi satırı güncelleyeceğinizi söyler.
 
 KAPUT SINIRI (hood_frac) için:
   Aynı aracı --kaput ile çalıştır ve aracı YAVAŞÇA İLERİ SÜR/İT. Kaput sabit
   durduğu için görüntünün alt bandı hiç değişmez; araç bunu tespit eder.
 """
 import sys
-import os
 
 import numpy as np
 import rclpy
@@ -26,8 +26,24 @@ from rclpy.node import Node
 from std_msgs.msg import Float32
 from sensor_msgs.msg import Image
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from kalibrasyon import kaydet as kalibrasyon_kaydet
+# kalibrasyon.yaml KALDIRILDI (2026-08-18). Bu arac olcumu yapar ama artik
+# hicbir yere yazamaz: cikan degeri ilgili dugumun icine ELLE yazin.
+PARAM_YERI = {
+    'lane_detection_node': 'SeritTespit/serit-tespitcopy.py',
+    'lidar_obstacle_detector': 'EngelTespit/engel-tespit.py',
+    'uart_sender_node': 'Haberlesme/uart_sender_node3.py',
+    'decision_making_node': 'KararAlg/basic-decision-making-node.py',
+    'zed_publisher_node': 'Kamera/zedi2connect_port.py',
+}
+
+
+def kalibrasyon_kaydet(dugum, ad, deger):
+    yer = PARAM_YERI.get(dugum, dugum)
+    print('\n  OTOMATIK KAYIT YOK - kalibrasyon.yaml kaldirildi.')
+    print(f"  KALICI yapmak icin {yer} icinde su satiri guncelleyin:")
+    print(f"      self.declare_parameter('{ad}', {deger})")
+    print('  Sistem CALISIRKEN denemek icin (kapaninca kaybolur):')
+    print(f"      ros2 param set /{dugum} {ad} {deger}")
 
 
 class KameraKalibrasyon(Node):
@@ -35,6 +51,7 @@ class KameraKalibrasyon(Node):
         super().__init__('kamera_kalibrasyon')
         self.kaput_modu = kaput_modu
         self.merkezler = []
+        self.viraj = []
         self.genislik = None
 
         # Kaput tespiti için: satır bazında zaman içindeki değişim birikimi
@@ -49,11 +66,19 @@ class KameraKalibrasyon(Node):
         else:
             self.create_subscription(Float32, '/lane/center_px',
                                      self.center_callback, 10)
+            # HİZA ÖLÇÜSÜ: araç şeride paralel değilse şerit görüntüde eğik
+            # görünür ve ölçülen merkez açıya göre kayar - offset her park
+            # edişte farklı çıkar. Bunu göze bırakmamak için ölçüyoruz.
+            self.create_subscription(Float32, '/lane/curve',
+                                     self.curve_callback, 10)
             print('/lane/center_px bekleniyor... (sistem çalışıyor mu?)')
 
         self.create_timer(0.5, self.yaz)
 
     # ---------------- merkez kayması ----------------
+    def curve_callback(self, msg):
+        self.viraj.append(float(msg.data))
+
     def center_callback(self, msg):
         self.merkezler.append(float(msg.data))
         if self.genislik is None:
@@ -78,6 +103,18 @@ class KameraKalibrasyon(Node):
                 self.satir_toplam += fark
             self.satir_kare += 1
         self.onceki_gri = gri
+
+    def hiza_medyani(self):
+        """Aracin seride gore acisi (viraj terimi medyani).
+
+        Kamera ileri baktigi icin 'serit donuyor' ile 'arac acili duruyor'
+        ayirt edilemez. Duz bir kesitte olcum yapiliyorsa bu deger dogrudan
+        HIZASIZLIGI verir: 0'dan uzaksa arac serie paralel degildir ve
+        olculen merkez aciya gore kayar.
+        """
+        if len(self.viraj) < 5:
+            return None
+        return float(np.median(self.viraj))
 
     def kaput_siniri(self):
         """Alttan yukarı: değişimin belirgin arttığı ilk satır = kaputun üstü."""
@@ -125,9 +162,17 @@ class KameraKalibrasyon(Node):
                 print(f'  standart sapma  : {sap:7.1f} px')
                 print()
                 print(f'  >>> camera_center_offset_px = {med - ref:+.1f}')
+                hiza = self.hiza_medyani()
+                if hiza is not None:
+                    durum = 'PARALEL' if abs(hiza) <= 0.10 else 'ACILI - DUZELT'
+                    print(f'  hiza (viraj)    : {hiza:+7.3f}   {durum}')
                 if sap > 40:
                     print('\n  ! Sapma yuksek. Arac gercekten seridin ortasinda mi,')
                     print('    yol/serit net goruluyor mu? Olcumu tekrarlayin.')
+                if hiza is not None and abs(hiza) > 0.10:
+                    print('\n  ! Arac serie PARALEL degil. Seridi egik goruyor;')
+                    print('    bu aciyla olculen offset yanlis cikar. Araci')
+                    print('    hiza ~0.000 olana kadar dondurun.')
         print('\n  CTRL+C = bitir ve kaydet (--kaydet verildiyse)')
 
     def sonuc(self):
@@ -146,7 +191,7 @@ class KameraKalibrasyon(Node):
             if kaydet_mi:
                 kalibrasyon_kaydet('lane_detection_node', 'hood_frac', round(oran, 3))
             else:
-                print('\n  Kaydetmek icin --kaydet ile calistirin.')
+                print('\n  Koda nereye yazilacagini gormek icin --kaydet ile calistirin.')
         else:
             if len(self.merkezler) < 5:
                 print('\n  Yeterli olcum yok. Sistem calisiyor mu?')
@@ -166,10 +211,28 @@ class KameraKalibrasyon(Node):
             # ortasinda degildi, serides acili duruyordu ya da model seridi
             # bulamadi. Boyle bir degeri kaydetmek araci surekli direksiyon
             # kirar hale getirir, o yuzden acikca zorlanmadikca kaydedilmez.
-            makul = abs(offset) <= 150
+            # SAPMA DA KAYDI ENGELLER. Eskiden yuksek sapma sadece UYARIYDI ve
+            # deger yine de yazilirdi; kalibrasyon.yaml'daki offset'in olcumden
+            # olcume +99 / -276 / +69 / +44 diye zipla masinin sebebi buydu.
+            # Sapma yuksekse rota merkezi zaten geziniyor demektir - o karede
+            # "arac seridin ortasinda" varsayimi kurulmuyor, medyan da anlamsiz.
+            hiza = self.hiza_medyani()
+            hizali = hiza is None or abs(hiza) <= 0.10
+            makul = abs(offset) <= 150 and sap <= 40 and hizali
+            if hiza is not None:
+                print(f'  hiza (viraj)   : {hiza:+.3f}   '
+                      f'({"paralel" if hizali else "ACILI"})')
+            if not hizali:
+                print(f'\n  ! ARAC SERIE PARALEL DEGIL (hiza {hiza:+.3f}).')
+                print('    Kamera ileri baktigi icin "serit donuyor" ile')
+                print('    "arac acili" ayirt edilemez; bu aciyla olculen')
+                print('    offset her park edisinde farkli cikar.')
+                print('    Araci hiza ~0.000 olana kadar dondurup tekrarlayin.')
             if sap > 40:
-                print('\n  ! Sapma yuksek, deger guvenilir olmayabilir.')
-            if not makul:
+                print(f'\n  ! SAPMA YUKSEK ({sap:.1f} px > 40): olcum guvenilir degil.')
+                print('    Duz bir kesitte, arac iki cizginin tam ortasinda ve')
+                print('    cizgilere PARALEL dururken tekrarlayin.')
+            if abs(offset) > 150:
                 print(f'\n  {"#" * 56}')
                 print(f'  #  SUPHELI DEGER: {offset:+.1f} px')
                 print(f'  {"#" * 56}')
@@ -184,12 +247,11 @@ class KameraKalibrasyon(Node):
             if kaydet_mi and (makul or '--zorla' in sys.argv):
                 kalibrasyon_kaydet('lane_detection_node',
                                    'camera_center_offset_px', round(offset, 1))
-                print('\n  Kaydedildi. Sistemi yeniden baslatin.')
             elif kaydet_mi and not makul:
-                print('\n  KAYDEDILMEDI. Gercekten dogru oldugundan eminseniz:')
+                print('\n  DEGER SUPHELI - yazmayin. Emin oldugunuzda:')
                 print('    python3 kalibrasyon_kamera.py --kaydet --zorla')
             elif not kaydet_mi:
-                print('\n  Kaydetmek icin --kaydet ile calistirin.')
+                print('\n  Koda nereye yazilacagini gormek icin --kaydet ile calistirin.')
         print('=' * 60)
 
 

@@ -33,6 +33,11 @@ TOPICLER=(
   /zed2i_rgb/image_raw     # kamera - serit ve levha tespitinin girdisi
   /scan                    # LiDAR - engel tespitinin girdisi
   /zed2i/odom              # ZED odometrisi (aciksa)
+  # Serit dugumu METRIK modda calisiyor: mesafe olcumu ve viraj tespiti
+  # derinlige dayali. Bu ikisi kayitta yoksa tekrar oynatmada viraj HIC
+  # olculmez, ayar yapilamaz. Derinlik ~100 MB/sn - kaydi kisa tutun.
+  /zed2i/depth
+  /zed2i/camera_info
 )
 
 echo "=============================================="
@@ -60,7 +65,8 @@ if [ ${#mevcut[@]} -eq 0 ]; then
 fi
 
 echo
-echo "  1280x720 goruntu ~55 MB/sn yer kaplar (sikistirmasiz)."
+echo "  RGB ~83 MB/sn + derinlik ~110 MB/sn = ~190 MB/sn ham (zstd ile ~1/3)."
+echo "  Viraj ayari icin TEK VIRAJ, 30-60 sn yeter - tur atmayin."
 echo "  Bitirmek icin CTRL+C."
 echo "=============================================="
 echo

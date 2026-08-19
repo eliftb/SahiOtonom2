@@ -4,20 +4,11 @@ from rclpy.node import Node
 from rclpy.executors import ExternalShutdownException
 from std_msgs.msg import Float32, Bool, String, Int32
 from rcl_interfaces.msg import SetParametersResult
-from ackermann_msgs.msg import AckermannDrive
 from enum import Enum
 import numpy as np
 import json
 import math
-import os
-import sys
 import time
-
-# Kalıcı kalibrasyon değerleri (bkz. kalibrasyon.yaml)
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from kalibrasyon import kalibrasyon
-
-KAL = kalibrasyon('decision_making_node')
 
 
 # Levha sınıfları (run_tracker.py'deki model isimleriyle birebir aynı olmalı)
@@ -44,10 +35,33 @@ DIRECTION_SIGNS = {          # koridor tercihi (-1 sol, +1 sağ)
 TURN_SIGNS = {               # mecburi dönüş (-1 sola dön, +1 sağa dön, 0 düz)
     'sola-mecburi-yon': -1,
     'ileriden-sola-mecburi-yon': -1,
+    'ileri-ve-sola-mecburi-yon': -1,
     'saga-mecburi-yon': +1,
     'ileriden-saga-mecburi-yon': +1,
+    'ileri-ve-saga-mecburi-yon': +1,
     'ileri-mecburi-yon': 0,       # açıkça DÜZ: bekleyen dönüşü iptal eder
 }
+
+
+def sinif_adini_sadelestir(ad):
+    """Model sınıf adını tabloların ASCII yazımına indirger.
+
+    NEDEN VAR: modelin sınıf adı 'ileriden-sağa-mecburi-yon' (Türkçe ğ ile),
+    buradaki tablo ise 'saga' yazıyordu. Eşleşme tutmadığı için o levha
+    tespit ediliyor, ekranda kutusu çiziliyor ama sign_callback onu HİÇBİR
+    dala sokmadan atlıyordu - yani araç levhayı görüp yok sayıyordu ve
+    ortada tek bir hata mesajı yoktu. Ad eşleştirmesini harf harf doğru
+    yazmaya bırakmak bu hatayı model her yeniden eğitildiğinde geri getirir;
+    normalleştirme sınıfın tamamını kapatır.
+    """
+    if not ad:
+        return ''
+    # Küçültmeden ÖNCE çevir: 'İ'.lower() birleşik noktalı i üretir ve
+    # karşılaştırmayı yine bozar.
+    return (ad.strip()
+            .translate(str.maketrans('ğüşıöçĞÜŞİÖÇ', 'gusiocGUSIOC'))
+            .lower()
+            .replace('_', '-'))
 
 
 class DriveState(Enum):
@@ -87,8 +101,9 @@ class DecisionMakingNode(Node):
         #     mesafe = ref_mesafe * ref_yukseklik / guncel_yukseklik
         # KALİBRASYON: aracı ışıktan ref_distance_m kadar uzağa koy, ekrandaki
         # kutunun piksel yüksekliğini oku, ref_box_height_px'e yaz.
-        self.declare_parameter('ref_distance_m', KAL('ref_distance_m', 4.0))
-        self.declare_parameter('ref_box_height_px', KAL('ref_box_height_px', 60.0))
+        self.declare_parameter('ref_distance_m', 4.0)
+        # TAHMİN - ölçülmedi. Bu yüzden "4 metre" gerçekte 4 m değil.
+        self.declare_parameter('ref_box_height_px', 60.0)
         # Kırmızı ışıkta bu mesafede durulur
         self.declare_parameter('stop_distance_m', 4.0)
         # 'dur' levhasında beklenecek süre
@@ -143,6 +158,8 @@ class DecisionMakingNode(Node):
         self.stop_sign_released_at = 0.0
         self.preferred_side = 0       # -1 sol, 0 yok, +1 sağ
         self.preferred_side_at = 0.0
+        # Kuralı olmayan levhalar: her karede uyarı basmamak için bir kez tutulur
+        self.kurali_olmayan = set()
         self.bekleyen_donus = 0       # -1 sola dön, 0 yok, +1 sağa dön
         self.bekleyen_donus_at = 0.0
         self.last_state_log = None
@@ -164,9 +181,6 @@ class DecisionMakingNode(Node):
             String, '/sign_detection/boxes', self.sign_callback, 10)
 
         # Publishers
-        self.ackermann_pub = self.create_publisher(
-            AckermannDrive, '/ackermann_cmd', 10)
-
         self.speed_pub = self.create_publisher(
             Float32, '/speed', 10)
 
@@ -251,6 +265,7 @@ class DecisionMakingNode(Node):
             if cls is None:
                 label = box.get('label', '')
                 cls = label.split(' ', 1)[1] if ' ' in label else label
+            cls = sinif_adini_sadelestir(cls)
             distance = self.estimate_distance(box)
 
             if cls == CLS_RED:
@@ -273,6 +288,14 @@ class DecisionMakingNode(Node):
                 self.get_logger().info(
                     f'🧭 Koridor tercihi: {cls} -> {"SOL" if self.preferred_side < 0 else "SAĞ"} '
                     f'({distance:.1f} m)')
+            elif cls not in self.kurali_olmayan:
+                # SESSİZ ATLAMAYI GÖRÜNÜR KIL. Yukarıdaki dalların hiçbirine
+                # girmeyen levha, araç için YOK demektir. Bunu bir kez de olsa
+                # yazmazsak "levhayı görüyor ama uymuyor" arızası ancak pistte
+                # ve tahminle bulunur.
+                self.kurali_olmayan.add(cls)
+                self.get_logger().warn(
+                    f'👀 Levha tanındı ama KURALI YOK, davranış değişmeyecek: {cls}')
 
     def _fresh(self, record):
         """Kayıt hâlâ geçerli mi (son sign_memory_sec içinde görüldü mü)."""
@@ -403,16 +426,6 @@ class DecisionMakingNode(Node):
             # Hızı hesapla
             speed = self.calculate_speed()
 
-            # Ackermann mesajı hazırla ve yayınla
-            ackermann_msg = AckermannDrive()
-            ackermann_msg.speed = speed
-            ackermann_msg.steering_angle = steering_angle
-            ackermann_msg.steering_angle_velocity = 0.0
-            ackermann_msg.acceleration = 0.0
-            ackermann_msg.jerk = 0.0
-            
-            self.ackermann_pub.publish(ackermann_msg)
-            
             # Speed mesajı hazırla ve yayınla
             speed_msg = Float32()
             speed_msg.data = speed

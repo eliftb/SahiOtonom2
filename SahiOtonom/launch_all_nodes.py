@@ -38,16 +38,16 @@ LIDAR_PORT = lidar_portu_bul()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # --- PIST KAYDI --------------------------------------------------------------
-# kalibrasyon.yaml icinde  kayit: true  yapilirsa sistem calisirken ham sensor
-# verisi otomatik kaydedilir. Pistte ayri terminal acip komut yazmak gerekmesin
-# diye burada: sure kisitliyken en az adim en az hata demek.
-sys.path.insert(0, BASE_DIR)
-try:
-    from kalibrasyon import kalibrasyon as _kal
-    KAYIT_ACIK = bool(_kal('launcher')('kayit', False))
-except Exception as _e:
-    print(f"[kayit] kalibrasyon.yaml okunamadi ({_e}), kayit kapali.")
-    KAYIT_ACIK = False
+# Burasi True yapilirsa sistem calisirken ham sensor verisi otomatik kaydedilir.
+# Pistte ayri terminal acip komut yazmak gerekmesin diye burada: sure
+# kisitliyken en az adim en az hata demek.
+# (Eskiden kalibrasyon.yaml'dan okunuyordu; o dosya 2026-08-18'de kaldirildi.)
+# Sistemi baslatmadan acmak icin:  KAYIT_ACIK = True
+# Sistem zaten calisiyorsa ayri kayit icin:  ./pist_kayit.sh
+# DIKKAT: DISK. RGB (~83 MB/sn) + derinlik (~110 MB/sn) = ~190 MB/sn ham;
+# zstd ile kabaca ucte biri. Bir dakikalik kayit ~4 GB. Viraj ayari icin
+# TEK VIRAJ yeter, tur atmaya gerek yok.
+KAYIT_ACIK = True
 
 KAYIT_KLASORU = os.path.join(BASE_DIR, 'kayitlar')
 KAYIT_ADI = time.strftime('pist_%Y%m%d_%H%M%S')
@@ -55,6 +55,16 @@ KAYIT_TOPICLERI = [
     '/zed2i_rgb/image_raw',   # serit + levha tespitinin girdisi
     '/scan',                  # engel tespitinin girdisi
     '/zed2i/odom',            # ZED odometrisi (aciksa)
+    # DERINLIK + KAMERA BILGISI (eklendi 2026-08-19). Serit dugumu METRIK modda
+    # (route_source='mesafe') calisiyor: sag cizginin metre cinsinden mesafesi
+    # ve viraj tespiti tamamen derinlige dayaniyor. Bu ikisi olmadan tekrar
+    # oynatmada fx/depth_image None kalir, _sag_cizgi_noktalari BOS doner ve
+    # viraj hic olculmez - eski kayitlarla viraj ayari yapilamamasinin sebebi
+    # buydu (kayitta yalnizca image_raw + odom vardi).
+    # BEDELI: derinlik float32 720p, ~100 MB/sn. Viraj ayari icin TUR degil
+    # TEK VIRAJ, 30-60 sn kaydi yeter.
+    '/zed2i/depth',
+    '/zed2i/camera_info',
 ]
 
 NODE_LAUNCH_ORDER = [
@@ -88,7 +98,7 @@ NODE_LAUNCH_ORDER = [
         # LiDAR DONANIM SÜRÜCÜSÜ. Eskiden bu ayrı terminalde elle başlatılıyordu
         # ve unutulduğunda /scan hiç yayınlanmıyordu: engel-tespit.py sessizce
         # ayakta kalıyor ("initialized" yazıyor) ama tek bir ölçüm bile almıyor,
-        # yani engel tespiti çalışıyor sanılıp aslında hiç çalışmıyordu.
+        # yani engel teslaunpiti çalışıyor sanılıp aslında hiç çalışmıyordu.
         # RPLIDAR S2M1-R2: baud 1000000 (A1'in 115200'ü DEĞİL).
         "name": "LIDAR SÜRÜCÜSÜ (RPLIDAR S2)",
         # Doğrudan 'ros2 launch' değil, RESET atan sarmalayıcı: RPLIDAR besleme

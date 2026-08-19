@@ -18,7 +18,6 @@ görün, sonra CTRL+C'ye basın: önerilen forward_angle_deg değerini ve girmen
 gereken komutu yazar.
 """
 import math
-import os
 import sys
 
 import numpy as np
@@ -26,8 +25,24 @@ import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from kalibrasyon import kaydet as kalibrasyon_kaydet
+# kalibrasyon.yaml KALDIRILDI (2026-08-18). Bu arac olcumu yapar ama artik
+# hicbir yere yazamaz: cikan degeri ilgili dugumun icine ELLE yazin.
+PARAM_YERI = {
+    'lane_detection_node': 'SeritTespit/serit-tespitcopy.py',
+    'lidar_obstacle_detector': 'EngelTespit/engel-tespit.py',
+    'uart_sender_node': 'Haberlesme/uart_sender_node3.py',
+    'decision_making_node': 'KararAlg/basic-decision-making-node.py',
+    'zed_publisher_node': 'Kamera/zedi2connect_port.py',
+}
+
+
+def kalibrasyon_kaydet(dugum, ad, deger):
+    yer = PARAM_YERI.get(dugum, dugum)
+    print('\n  OTOMATIK KAYIT YOK - kalibrasyon.yaml kaldirildi.')
+    print(f"  KALICI yapmak icin {yer} icinde su satiri guncelleyin:")
+    print(f"      self.declare_parameter('{ad}', {deger})")
+    print('  Sistem CALISIRKEN denemek icin (kapaninca kaybolur):')
+    print(f"      ros2 param set /{dugum} {ad} {deger}")
 
 
 HARITA_YARICAP_M = 5.0     # haritanın kapsadığı yarıçap
@@ -139,14 +154,10 @@ class LidarKalibrasyon(Node):
             print('\n  ! Sapma yuksek. Kutu sabit duruyor mu, baska cisim')
             print('    ayni mesafede mi? Olcumu tekrarlayin.')
         if '--kaydet' in sys.argv:
-            # Kalici olarak kalibrasyon.yaml'a yaz: bir daha olcmek gerekmez,
-            # her acilista otomatik yuklenir.
             kalibrasyon_kaydet('lidar_obstacle_detector', 'forward_angle_deg',
                                round(derece, 1))
-            print('\n  Kalici olarak kaydedildi (kalibrasyon.yaml).')
-            print('  Bir dahaki acilista otomatik yuklenecek.')
         else:
-            print('\n  Kalici kaydetmek icin bu araci --kaydet ile calistirin:')
+            print('\n  Degeri koda nasil isleyeceginizi gormek icin:')
             print('    python3 kalibrasyon_lidar.py --kaydet')
             print('\n  Ya da sadece bu oturum icin:')
             print(f'    ros2 param set /lidar_obstacle_detector forward_angle_deg {derece:.1f}')
