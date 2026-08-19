@@ -119,22 +119,67 @@ class UartSenderNode(Node):
         # "dönmüyor" görünüyordu. Eski 1.0 ise sönümsüz olduğu için
         # salınıyordu; aşağıdaki kd 0.3 ile birlikte 0.8 hem düzeltir hem
         # savurmaz. Salınırsa 0.6'ya çek, hâlâ tembelse 1.0'a çıkar.
+        # ÖLÇÜME DAYALI (2026-08-19). kp 0.8 ile 0.9 m yanal hata direksiyonu
+        # 26°'ye götürüyordu; oysa pistin gerçek virajı (R=4.9 m, odometriden
+        # ölçüldü) sadece 3-5° istiyor. Araç şeridi tek hamlede geçip karşı
+        # tarafa aşıyor, sonra geri geliyor - loglardaki salınım buydu.
+        # 0.3 + hata ölçeği 4.0 ile 0.9 m hata ≈ 4° veriyor.
+        # KANITLANMIŞ DEĞER (2026-08-19 turu). Bu kazançla sapma logda
+        # -0.367 -> -0.226 -> -0.154 -> -0.078 -> 0.000 diye DÜZGÜNCE
+        # yakınsadı ve direksiyon merkeze döndü. 0.8 ile aynı araç zikzak
+        # çizip tam kilide dayanıyordu (Dev 1.000, Byte d,100).
+        # SABAHKİ DEĞERE DÖNÜLDÜ (2026-08-19 akşam). Aşağıdaki 0.3
+        # gerekçesi bir hatayı içeriyordu: 'pistin virajı 3-5° istiyor' doğru
+        # ama o FEEDFORWARD - virajı TAKİP etmek için gereken açı. Yanal HATAYI
+        # DÜZELTMEK için gereken açı ayrı bir şey. 0.9 m hataya da 4° verilince
+        # araç hatayı virajın tamamından daha yavaş kapatır: şeritten çıkar ve
+        # geri gelemez. Pistte görülen buydu - 0.3 ile şerit takibi durdu.
+        # 0.8 + ölçek 2.5 ile araç zikzak çizebilir AMA şeritte kalır. Zikzak
+        # varsa doğru yön 0.3'e inmek değil, aradan (0.5-0.6) denemektir.
         self.declare_parameter('kp', 0.8)
         # ki KAPALI. p ve i birlikte iterken frenleyen terim yoktu, araç şerit
         # merkezi etrafında salınıyordu. Kalıcı bir yana çekme varsa önce
         # steering_trim'e bakın; ki en son açılır (0.2 gibi küçük başlayın).
+        # İNTEGRAL AÇILDI (2026-08-19). Sadece P ile SABİT bir bozucu asla
+        # sıfırlanmaz: araç mekanik olarak bir yana çekiyorsa (direksiyon
+        # merkezi tam ölçülmemişse, teker düzeni yamuksa, kamera ofseti varsa)
+        # kontrol kalıcı bir sapmada dengeye oturur ve araç sürekli o tarafta
+        # gider. Pistte tam bu görüldü: araç ısrarla SOL şeride kaçıyordu.
+        # İntegral bu sabit farkı zamanla toplayıp kendi kapatır.
+        # Anti-windup ve i_limit zaten var; salınım başlarsa önce bunu düşürün.
+        # İNTEGRAL KAPALI KALSIN. Açıldığında ('full sola' turu) birikip
+        # direksiyonu kilide dayadı. Sabit yanlılık varsa önce steering_trim
+        # ölçülmeli; integral onu maskelemek için doğru araç değil.
         self.declare_parameter('ki', 0.0)
         # kd [s] - sönümleme. Salınım başlarsa artırın, tepki geç kalırsa azaltın.
+        # TÜREV DÜŞÜRÜLDÜ. Ölçüm kare kare zıplıyor (çizgi kilidi değişiyor);
+        # 20 Hz'de kd 0.3 bu zıplamayı direksiyona sıçrama olarak geçiriyordu.
+        # SABAHKİ DEĞERE DÖNÜLDÜ. Yukarıdaki 'ölçüm zıplıyor' gözlemi geçerli;
+        # zıplama sürüyorsa çözüm kd'yi kısmak DEĞİL d_filter'ı artırmaktır
+        # (kd hatayı kapatan sönümü de birlikte götürüyor).
         self.declare_parameter('kd', 0.3)
         # İntegral teriminin direksiyona katkı SINIRI (radyan). Doğrudan radyan
         # olmasının sebebi: eskiden integralin kendisi sınırlanıyordu, o yüzden
         # sınırın direksiyona ne kadar etki ettiği ki'ye bağlıydı ve okunmuyordu.
+        # İntegralin katkı sınırı (rad). 0.06 = 3.4° idi; ölçülmemiş bir
+        # direksiyon merkezini kapatmaya yetmiyordu. 0.12 = ~7°.
         self.declare_parameter('i_limit', 0.06)
         # Türev filtresi (0-1). 30 Hz'de ham türev ölçüm gürültüsünü büyütüyor;
         # bu EMA katsayısı ne kadar küçükse türev o kadar yumuşak.
         self.declare_parameter('d_filter', 0.3)
         # Araç şeride doğru değil de ŞERİTTEN DIŞARI kırıyorsa bunun işaretini çevir
         # (2026-07-12: araç sürekli sağa kaçtığı için +1.0 -> -1.0 yapıldı)
+        # FİZİKSEL EŞLEME - PİSTTE GÖZLE DOĞRULANDI (2026-08-19):
+        #     byte > 230  =  teker SAĞA
+        #     byte < 230  =  teker SOLA
+        # Bu değer sapmayı byte'a çeviren İŞARETTİR. -1.0 ile 'sapma > 0'
+        # (araç şeridin solunda, sağa kırmalı) byte'ı 230'un ÜSTÜNE çıkarır.
+        #
+        # BİR KEZ +1.0 DENENDİ VE TERS ÇIKTI (araç sağa kırması gerekirken
+        # sola kırdı). Bir daha değiştirmeden önce şu ölçümü yapın - 30 sn
+        # sürer ve şerit tespitinden tamamen bağımsızdır:
+        #     python3 Haberlesme/uart_sender_node3.py --kalibrasyon --tarama
+        # d,0 gönderildiğinde teker SAĞA dönüyorsa bu değer +1.0 olmalı.
         self.declare_parameter('steering_direction', -1.0)
         # TRİM: Tekerlerin GERÇEKTEN düz olduğu byte ile yazılımın varsaydığı
         # 180 arasındaki fark. Birim: d komutunun birimi. Araç SOLA çekiyorsa
@@ -202,6 +247,19 @@ class UartSenderNode(Node):
         # gelmeyince motoru kesen tür) bu doğrudan gaz kesintisi demek.
         # 0 yapılırsa zamanlayıcı kapanır, eski davranışa dönülür.
         self.declare_parameter('gaz_tekrar_hz', 10.0)
+        # AÇILIŞTA GAZ (2026-08-19, istek üzerine).
+        # Eskiden düğüm _son_hiz=0 / _son_fren=1 ile başlıyordu: ilk /speed
+        # mesajı gelene kadar porta FREN yazılıyordu. Bu değer True iken düğüm
+        # gaz basılı başlar, yani gaz porta giden İLK komut olur - direksiyon
+        # komutundan da önce (direksiyon ancak şerit mesajı gelince gönderilir).
+        #
+        # DİKKAT - NE ZAMAN KAPATILMALI: engel/ışık/levha frenlerinin HEPSİ
+        # karar düğümünde yaşıyor. launch_all_nodes.py bu düğümü EN SON
+        # başlattığı için normal açılışta karar düğümü zaten ayakta ve o
+        # korumalar aktif. Ama bu dosya TEK BAŞINA çalıştırılırsa araç hiçbir
+        # koruma olmadan gaza basar. Sehpa/tek başına test için:
+        #     ros2 param set /uart_sender_node acilista_gaz false
+        self.declare_parameter('acilista_gaz', True)
         # DİREKSİYON KOMUT HIZI (Hz). Şerit düğümü ~20 kare/sn yayınlıyor ve
         # her karede bir 'd' komutu gidiyordu. Gaz komutlarıyla birlikte porta
         # yığılan trafik Arduino'nun giriş tamponunu taşırabilir; taşınca
@@ -227,12 +285,19 @@ class UartSenderNode(Node):
         self.gaz_tekrar_hz = float(self.get_parameter('gaz_tekrar_hz').value)
         self.direksiyon_hz = float(self.get_parameter('direksiyon_hz').value)
         self._son_direksiyon_zamani = 0.0
-        # Zamanlayıcının tekrarlayacağı son gaz/fren değeri
-        self._son_hiz = 0
-        self._son_fren = 1
+        # Zamanlayıcının tekrarlayacağı son gaz/fren değeri.
+        # acilista_gaz True ise gaz basılı, fren serbest başlar (bkz. yukarısı).
+        self.acilista_gaz = bool(self.get_parameter('acilista_gaz').value)
+        self._son_hiz = self.hiz_degeri if self.acilista_gaz else 0
+        self._son_fren = 0 if self.acilista_gaz else 1
         self.hareket_esigi_m = float(self.get_parameter('hareket_esigi_m').value)
         self._ilk_konum = None
         self._hareket_basladi = False
+        # DİREKSİYON YÖNÜ OTOMATİK DENETİMİ (bkz. odom_callback)
+        self._son_direksiyon_acisi = 0.0
+        self._yon_onceki = None          # (zaman, yaw)
+        self._yon_oy = 0                 # + ters, - dogru
+        self._yon_uyarildi = False
         self.start_time = time.time()
         self.straight_phase_done = False
 
@@ -279,6 +344,16 @@ class UartSenderNode(Node):
         self.port_hazir_zamani = 0.0     # Arduino açılışta reset atar, o kadar bekle
         self.baglanti_uyarildi = False
         self._portu_ac(ilk=True)
+        # GAZ İLK KOMUT OLSUN. Zamanlayıcıyı beklemeden burada yazıyoruz ki
+        # porta giden ilk bayt gaz olsun. Arduino henüz reset'ten çıkmadıysa
+        # send_command sessizce düşer - sorun değil, aşağıdaki 10 Hz kalp
+        # atışı hazır olur olmaz aynı değeri tekrar yazar.
+        if self.acilista_gaz:
+            self.send_command('h', self._son_hiz)
+            self.send_command('f', self._son_fren)
+            self.get_logger().warn(
+                f'🏁 AÇILIŞTA GAZ AÇIK - h,{self._son_hiz} f,{self._son_fren} '
+                f'gönderildi. Araç ilk komutla hareket edebilir.')
         # Bağlantı denetçisi: kopmuşsa 2 saniyede bir yeniden dener
         self.baglanti_timer = self.create_timer(2.0, self._baglanti_kontrol)
         # GAZ KALP ATIŞI: son hız/fren değerini sabit hızda tekrarlar.
@@ -321,7 +396,7 @@ class UartSenderNode(Node):
                    'steering_trim', 'max_steering_angle', 'straight_start_sec',
                    'heading_hold', 'kp_heading', 'heading_hold_max_sec',
                    'turn_angle_deg', 'satir_sonu', 'hareket_esigi_m',
-                   'hiz_degeri', 'gaz_tekrar_hz', 'direksiyon_hz')
+                   'hiz_degeri', 'gaz_tekrar_hz', 'direksiyon_hz', 'acilista_gaz')
 
     def _on_parameter_update(self, params):
         for p in params:
@@ -528,6 +603,41 @@ class UartSenderNode(Node):
     def odom_callback(self, msg: Odometry):
         self.guncel_yaw = self._yaw(msg.pose.pose.orientation)
 
+        # --- DİREKSİYON YÖNÜ DENETİMİ ---------------------------------
+        # Komut edilen direksiyon ile aracın GERÇEKTEN döndüğü yön tutuyor mu?
+        # ROS kuralı: yaw ARTARSA araç SOLA dönüyor. Kodda pozitif direksiyon
+        # açısı = byte > merkez = fiziksel SAĞ = yaw AZALIR. Yani doğru
+        # bağlantıda aci * yaw_hizi < 0 olmalı. Üst üste tersi çıkıyorsa
+        # steering_direction yanlıştır ve araç her düzeltmeyi ters yapar.
+        # Bu denetim gözle tahmin etmeyi bitirir: araç kendi kendini ölçer.
+        simdi_t = time.time()
+        if self._yon_onceki is not None:
+            dt = simdi_t - self._yon_onceki[0]
+            if dt > 0.05:
+                dyaw = math.atan2(math.sin(self.guncel_yaw - self._yon_onceki[1]),
+                                  math.cos(self.guncel_yaw - self._yon_onceki[1]))
+                yaw_hizi = dyaw / dt
+                aci = self._son_direksiyon_acisi
+                # Yalnızca anlamlı direksiyon + gerçek dönüş varken oy ver
+                if abs(aci) > 0.05 and abs(yaw_hizi) > math.radians(5):
+                    self._yon_oy += 1 if (aci * yaw_hizi) > 0 else -1
+                    self._yon_oy = max(-40, min(self._yon_oy, 40))
+                    if self._yon_oy >= 20 and not self._yon_uyarildi:
+                        self._yon_uyarildi = True
+                        self.get_logger().error(
+                            '🔄 DİREKSİYON TERS BAĞLI. Komut edilen yön ile aracın '
+                            'gerçekten döndüğü yön 20 ölçümde ters çıktı. '
+                            f'steering_direction şu an {self.steering_direction:+.0f}; '
+                            f'{-self.steering_direction:+.0f} olmalı:  ros2 param set '
+                            f'/uart_sender_node steering_direction {-self.steering_direction:.1f}')
+                    elif self._yon_oy <= -20 and not self._yon_uyarildi:
+                        self._yon_uyarildi = True
+                        self.get_logger().info(
+                            '✅ Direksiyon yönü DOĞRU (komut ile gerçek dönüş uyuşuyor).')
+                self._yon_onceki = (simdi_t, self.guncel_yaw)
+        else:
+            self._yon_onceki = (simdi_t, self.guncel_yaw)
+
         # HAREKET BAŞLADI MI: direksiyon bunu bekliyor (bkz. hareket_esigi_m).
         k = msg.pose.pose.position
         if self._ilk_konum is None:
@@ -713,6 +823,7 @@ class UartSenderNode(Node):
                 return
             self._son_direksiyon_zamani = simdi
 
+        self._son_direksiyon_acisi = steering_angle
         angle_byte = self.angle_to_byte(steering_angle)
         self.send_command('d', angle_byte)   # d -> direksiyon
         self.get_logger().info(f'🎯 LATERAL KONTROL | Dev: {self.current_lateral_deviation:.3f} | '

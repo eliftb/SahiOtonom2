@@ -108,6 +108,18 @@ class LaneDetectionNode(Node):
         # 1.0 iken kp=1.0 ile 0.5 m'lik hata direksiyonu TAVANA dayıyordu
         # (0.5 rad ~ 29°); araç sert kırıp aşıyor ve şeritten çıkıyordu.
         # 2.5 ile aynı hata ~11° veriyor - düzeltir ama savurmaz.
+        # 2.5 -> 4.0 (2026-08-19). 2.5 ile 0.9 m hata sapmayı 0.37'ye
+        # çıkarıyor ve kp ile birlikte direksiyonu tavana dayıyordu. 4.0 ile
+        # aynı hata 0.22 sapma verir; kp 0.3 ile ≈4° direksiyon demek - pistin
+        # gerçek virajının istediği açı bu.
+        # KANITLANMIŞ DEĞER: kp 0.3 ile birlikte sapmanın düzgün yakınsadığı
+        # tur bu ölçekle koşuyordu. 2.5 ile aynı hata direksiyonu tavana
+        # dayıyor ve araç şeridi bir hamlede geçiyordu.
+        # SABAHKİ DEĞERE DÖNÜLDÜ (2026-08-19 akşam). 4.0 tek başına makuldü
+        # ama kp 0.8->0.3 ile AYNI ANDA değişti ve ikisi aynı yönde çarpıştı:
+        # etkin döngü kazancı 0.320 -> 0.075, yani 4.3 KAT zayıfladı. 0.6 m
+        # hatada sabah 23° istenirken şimdi 5° isteniyordu - araç şeridi
+        # düzeltemeyip dışarı akıyordu.
         self.declare_parameter('mesafe_hata_olcegi_m', 2.5)
         # Derinlik gürültülüdür; çizgi çevresinden bu yarıçapta medyan alınır.
         self.declare_parameter('derinlik_pencere_px', 7)
@@ -118,7 +130,55 @@ class LaneDetectionNode(Node):
         # çalışıp ŞERİT DEĞİŞTİRİR. Gerçek bir yanal hareket bu kadar ani
         # olamayacağı için, sıçrayan ölçüm kabul edilmez: ölçüm yok sayılır ve
         # araç önceki şeridini korur.
+        # --- ÖLÇÜM GEÇERLİLİK BANDI (3 m'lik şeride göre) -------------------
+        # Araç KENDİ ŞERİDİNDE ise sağdaki çizgi bu aralıkta olmak zorunda:
+        #     şeridin ortası      -> 1.5 m   (hedef)
+        #     sağ çizgiye yapışık -> ~0.3 m
+        #     sol çizgiye yapışık -> ~2.5 m  (şeridin sınırı)
+        #     yan şeridin çizgisi -> ~4.5 m  (bizim çizgimiz DEĞİL)
+        # Bandın dışındaki okuma ya yanlış çizgiye kilitlenmedir ya da araç
+        # zaten şeridin dışındadır; ikisinde de o sayıyı hedefe kovalamak
+        # aracı daha da uzağa götürür. Pistte 2.78 m okundu ve araç o çizgiye
+        # doğru sürüklendi - şeritten çıkmasının sebebi buydu.
+        # Bandın dışı ÖLÇÜM YOK sayılır: son komut sönümlenir, araç düz gider.
+        # --- MERKEZDE YUMUŞAK, KENARDA SERT ---------------------------------
+        # Tek eğimli kontrol iki isteği aynı anda karşılayamıyor: zikzak
+        # yapmayacak kadar yumuşak olursa kenara kaçmayı geç yakalıyor, kenarı
+        # yakalayacak kadar sert olursa ortada salınıyor.
+        #
+        # merkez_bandi_m: şerit ortasından bu kadar sapma NORMAL sayılır,
+        #   tepki doğrusal ve yumuşaktır (ortada gereksiz düzeltme yapmaz).
+        # kenar_kazanci : bandın dışında hata bu katsayıyla büyütülür, yani
+        #   araç çizgiye yaklaştıkça geri çekiş sertleşir.
+        #
+        # 3 m'lik şeritte: hata 0.5 m = araç ortadan yarım metre kaymış (hâlâ
+        # şeritte); hata 1.4 m = çizginin dibinde. İkisine aynı tepkiyi vermek
+        # yanlış - ikincisinde şerit ihlali an meselesidir.
+        # ŞERİT GENİŞLİĞİ (m) - ÖLÇÜLDÜ: 3.0. Referansın yan şeridin
+        # çizgisine kaymasını yakalamak için gerekli (bkz. _mesafe_sapmasi).
+        self.declare_parameter('serit_genisligi_m', 0.0)   # 0 = serit gecis tespiti KAPALI
+        self.declare_parameter('merkez_bandi_m', 0.5)
+        self.declare_parameter('kenar_kazanci', 1.0)   # 1.0 = KAPALI (dogrusal, sabahki gibi)
+        # MAKULLÜK BANDI AÇILDI (2026-08-19, "1.5 metreyi referans alsın").
+        # Band kapalıyken (0/99) sağdaki EN YAKIN çizgi olarak yan şeridin
+        # çizgisi ya da bir bariyer ölçülse bile geçerli sayılıyordu. hedef
+        # 1.5 m olduğu için 3 m'lik bir okuma 'çok soldayım' diye yorumlanıp
+        # aracı sağa, yani YAN ŞERİDE sürüyordu; oraya varınca hata sıfırlanıp
+        # kontrolcüye göre her şey yolunda görünüyordu. Şerit değiştirmesinin
+        # sebebi buydu.
+        # 1.5 ± 1.0 m: kendi şeridinde makul her yeri kapsar, komşu şeridin
+        # çizgisini (≈3 m) kapsamaz.
+        self.declare_parameter('mesafe_alt_sinir_m', 0.5)
+        self.declare_parameter('mesafe_ust_sinir_m', 2.5)
         self.declare_parameter('mesafe_sicrama_esigi_m', 0.8)
+        # KİLİT KAÇ KARE SONRA AÇILIR. Sıçrama koruması reddettiği karede
+        # son_mesafe_m'i KORUYOR; araç gerçekten yer değiştirdiyse referans
+        # DONUYOR ve ondan sonraki her ölçüm o bayat değere göre reddediliyor.
+        # Kilit bir kez kapanınca bir daha açılmıyordu: kayıtta 110 karenin
+        # 75'i böyle elendi ve /lane/valid False'a düşüp araç 'şerit yok'
+        # moduna geçti. Bu kadar kare üst üste aynı yönde ölçüm geliyorsa
+        # sıçrama değil GERÇEK hareket demektir; referans yenilenir.
+        self.declare_parameter('mesafe_sicrama_kabul_kare', 9999)   # 9999 = kilit acilmaz (sabahki)
 
         # /lane/valid NE ZAMAN False OLMALI. UART düğümü bu bayrağı görünce
         # şerit takibini TAMAMEN bırakıp odometriyle düz gidiyor (kavşak
@@ -290,7 +350,15 @@ class LaneDetectionNode(Node):
         self.hedef_sag_mesafe_m = float(self.get_parameter('hedef_sag_mesafe_m').value)
         self.mesafe_hata_olcegi_m = float(self.get_parameter('mesafe_hata_olcegi_m').value)
         self.derinlik_pencere_px = int(self.get_parameter('derinlik_pencere_px').value)
+        self.serit_genisligi_m = float(self.get_parameter('serit_genisligi_m').value)
+        self.merkez_bandi_m = float(self.get_parameter('merkez_bandi_m').value)
+        self.kenar_kazanci = float(self.get_parameter('kenar_kazanci').value)
+        self.mesafe_alt_sinir_m = float(self.get_parameter('mesafe_alt_sinir_m').value)
+        self.mesafe_ust_sinir_m = float(self.get_parameter('mesafe_ust_sinir_m').value)
         self.mesafe_sicrama_esigi_m = float(self.get_parameter('mesafe_sicrama_esigi_m').value)
+        self.mesafe_sicrama_kabul_kare = int(
+            self.get_parameter('mesafe_sicrama_kabul_kare').value)
+        self._sicrama_sayaci = 0
         self.gecerlilik_kayip_kare = int(self.get_parameter('gecerlilik_kayip_kare').value)
         self.olcum_ileri_mesafe_m = float(self.get_parameter('olcum_ileri_mesafe_m').value)
         self.max_line_jump_frac = float(self.get_parameter('max_line_jump_frac').value)
@@ -407,6 +475,9 @@ class LaneDetectionNode(Node):
                    'max_line_jump_frac', 'auto_lane_width',
                    'lane_width_min_frac', 'lane_width_max_frac',
                    'hedef_sag_mesafe_m', 'mesafe_hata_olcegi_m',
+                   'mesafe_sicrama_esigi_m', 'mesafe_sicrama_kabul_kare',
+                   'mesafe_alt_sinir_m', 'mesafe_ust_sinir_m',
+                   'merkez_bandi_m', 'kenar_kazanci', 'serit_genisligi_m',
                    'derinlik_pencere_px',
                    'mesafe_sicrama_esigi_m', 'gecerlilik_kayip_kare',
                    'olcum_ileri_mesafe_m')
@@ -912,6 +983,37 @@ class LaneDetectionNode(Node):
         height, width = lane_mask.shape
         olcum = self._sag_cizgi_mesafesi(lane_mask)
 
+        # BAND: ELEME DEĞİL KIRPMA.
+        # Eskiden bandın dışını atıyordum ama bu, aracın şeritten KAÇTIĞI anı
+        # da eliyordu: okuma 2.5 m'yi aşınca ölçüm yok sayılıyor, sapma
+        # sönümleniyor ve araç tam düzeltmesi gereken anda kör kalıyordu.
+        # Doğrusu yönü korumak: 2.5 m üstü okuma 'çok soldayım, sağa git'
+        # bilgisini taşır; büyüklüğü sınırlanır ama bilgi atılmaz.
+        band_disi = False
+        if olcum is not None:
+            ham = olcum[0]
+            kirpik = float(np.clip(ham, self.mesafe_alt_sinir_m,
+                                   self.mesafe_ust_sinir_m))
+            if kirpik != ham:
+                band_disi = True
+                olcum = (kirpik, olcum[1], olcum[2])
+
+        # İLK REFERANS BAND İÇİNDEN KURULUR.
+        # Sıçrama kilidi ancak elde bir referans varken koruyor (onceki is not
+        # None). İlk karede referans YOKTU, yani ilk ölçüm ne gelirse takip
+        # edilecek çizgi o oluyordu - yanlış çizgiyle başlarsak kilit de o
+        # yanlışı savunuyor. Band dışı bir okumayla referans KURMUYORUZ;
+        # ölçüm yokmuş gibi davranıp makul bir kare bekliyoruz.
+        if olcum is not None and self.son_mesafe_m is None and band_disi:
+            if not getattr(self, '_ilk_referans_uyarildi', False):
+                self._ilk_referans_uyarildi = True
+                self.get_logger().warn(
+                    f'⏳ İlk referans BEKLETİLDİ: ölçüm {ham:.2f} m, makul band '
+                    f'{self.mesafe_alt_sinir_m:.1f}-{self.mesafe_ust_sinir_m:.1f} m '
+                    f'dışında (hedef {self.hedef_sag_mesafe_m:.1f} m). Yanlış '
+                    f'çizgiye kilitlenmemek için bu kare atlandı.')
+            olcum = None
+
         if olcum is None:
             # ÇİZGİ KAYBOLDU. Viraj algılama KALDIRILDI (2026-08-19): tek kural
             # 'sağdaki çizgiyle hedef mesafeyi koru'. Çizgi yokken uydurulacak
@@ -925,7 +1027,7 @@ class LaneDetectionNode(Node):
             # Kısa kayıpta kontrolü BIRAKMA: eski komut sönümlenerek sürer.
             self.lane_valid = self.lost_frames <= self.gecerlilik_kayip_kare
 
-            self.debug_source = 'mesafe-yok'
+            self.debug_source = 'mesafe-disi' if band_disi else 'mesafe-yok'
             son = self.deviation_history[-1] if self.deviation_history else 0.0
             sonuc = son * 0.85
             self._push_history(sonuc)
@@ -940,15 +1042,58 @@ class LaneDetectionNode(Node):
         onceki = self.son_mesafe_m
         if (onceki is not None
                 and abs(mesafe - onceki) > self.mesafe_sicrama_esigi_m):
-            self.lost_frames += 1
-            self.debug_source = 'mesafe-sicrama'
-            # Bilerek eski şeridi koruyoruz: bu bir KARAR, kontrol kaybı değil.
-            self.lane_valid = self.lost_frames <= self.gecerlilik_kayip_kare
-            # son_mesafe_m KORUNUR: hedefimiz hâlâ eski çizgi.
-            son = self.deviation_history[-1] if self.deviation_history else 0.0
-            sonuc = son * 0.85
-            self._push_history(sonuc)
-            return float(sonuc)
+            # ŞERİT DEĞİŞTİRME Mİ? Araç kendi sol çizgisini geçerse o çizgi
+            # artık SAĞINDA kalır ve 'en yakın sağ çizgi' bir anda o olur:
+            # okuma bir ŞERİT GENİŞLİĞİ kadar düşer. Bunu kabul etmek aracı
+            # yan şeridin ortasına yerleştirir ve kontrol açısından her şey
+            # yolunda görünür - şerit ihlali tam olarak böyle oluyor.
+            # Okumayı bir şerit genişliği ekleyerek ESKİ çizgiye geri
+            # çeviriyoruz: araç 'çok soldayım' bilgisini alır ve sağa döner.
+            W = self.serit_genisligi_m
+            if W > 0 and abs((mesafe + W) - onceki) < abs(mesafe - onceki):
+                duzeltilmis = mesafe + W
+                if abs(duzeltilmis - onceki) <= self.mesafe_sicrama_esigi_m:
+                    if self._sicrama_sayaci == 0:
+                        self.get_logger().warn(
+                            f'🚧 ŞERİT ÇİZGİSİ GEÇİLDİ: ölçüm {mesafe:.2f} m '
+                            f'(referans {onceki:.2f} m). Bir şerit genişliği '
+                            f'eklenip {duzeltilmis:.2f} m sayıldı - araç kendi '
+                            f'şeridine geri çekiliyor.')
+                    self._sicrama_sayaci = 0
+                    self.lost_frames = 0
+                    self.lane_valid = True
+                    self.debug_source = 'serit-gecildi'
+                    self.son_mesafe_m = duzeltilmis
+                    hata = duzeltilmis - self.hedef_sag_mesafe_m
+                    band = max(self.merkez_bandi_m, 0.0)
+                    etkin = (hata if abs(hata) <= band else math.copysign(
+                        band + (abs(hata) - band) * max(self.kenar_kazanci, 1.0), hata))
+                    return self._yumusat_ve_sinirla(float(np.clip(
+                        etkin / max(self.mesafe_hata_olcegi_m, 1e-3), -1.0, 1.0)))
+
+            # KİLİT TAKILI KALMASIN: üst üste bu kadar kare aynı şeyi
+            # ölçüyorsak sıçrama değil gerçek hareket; referansı yenile.
+            self._sicrama_sayaci += 1
+            if self._sicrama_sayaci >= max(self.mesafe_sicrama_kabul_kare, 1):
+                self.get_logger().warn(
+                    f'↔️  Sıçrama kilidi {self._sicrama_sayaci} karedir açık '
+                    f'(referans {onceki:.2f} m, ölçüm {mesafe:.2f} m) - '
+                    f'gerçek hareket sayılıp referans yenilendi.')
+                self._sicrama_sayaci = 0
+                self.son_mesafe_m = mesafe
+                self.lost_frames = 0
+            else:
+                self.lost_frames += 1
+                self.debug_source = 'mesafe-sicrama'
+                # Bilerek eski şeridi koruyoruz: bu bir KARAR, kontrol kaybı değil.
+                self.lane_valid = self.lost_frames <= self.gecerlilik_kayip_kare
+                # son_mesafe_m KORUNUR: hedefimiz hâlâ eski çizgi.
+                son = self.deviation_history[-1] if self.deviation_history else 0.0
+                sonuc = son * 0.85
+                self._push_history(sonuc)
+                return float(sonuc)
+
+        self._sicrama_sayaci = 0
 
         self.lost_frames = 0
         self.lane_valid = True
@@ -965,7 +1110,17 @@ class LaneDetectionNode(Node):
         # için 1.5 m'yi korumak aracı zaten virajdan geçirir. Üstüne yanlılık
         # eklemek bu kuralla çekişir ve şeritten kaydırırdı.
         hata = mesafe - self.hedef_sag_mesafe_m
-        sapma = hata / max(self.mesafe_hata_olcegi_m, 1e-3)
+
+        # KADEMELİ TEPKİ: merkez bandı içinde doğrusal ve yumuşak, dışında
+        # kenar_kazanci ile büyütülmüş. Amaç şeridin ORTASINDA kalmak ve
+        # çizgiye yaklaşıldığında kararlı biçimde geri çekilmek.
+        band = max(self.merkez_bandi_m, 0.0)
+        if abs(hata) <= band:
+            etkin = hata
+        else:
+            etkin = math.copysign(
+                band + (abs(hata) - band) * max(self.kenar_kazanci, 1.0), hata)
+        sapma = etkin / max(self.mesafe_hata_olcegi_m, 1e-3)
         return self._yumusat_ve_sinirla(float(np.clip(sapma, -1.0, 1.0)))
 
     def depth_callback(self, msg):
@@ -1043,7 +1198,15 @@ class LaneDetectionNode(Node):
                 m, c = np.polyfit(Z, X, 1)
                 # Ölçüm aralığının dışına taşma: uzağa uzatmak güvenilmez
                 z_kirp = float(np.clip(hedef_z, Z.min(), Z.max()))
-                return float(m * z_kirp + c), en_yakin[2], en_yakin[3]
+                deger = float(m * z_kirp + c)
+                # UYDURULAN DEĞER ÖLÇÜLENLERİN DIŞINA ÇIKAMAZ.
+                # 2-3 noktaya çekilen doğru, Z aralığının İÇİNDE bile ölçülen
+                # en küçük X'in altına inebiliyor. Kayıtta (2026-08-19)
+                # -0.16 m okundu; negatif mesafe fiziksel olarak imkânsız
+                # (yalnızca aracın SAĞINDAKİ noktalar alınıyor) ama sapmayı
+                # -0.42'ye götürüp direksiyonu ters tarafa kırdırıyor.
+                return (float(np.clip(deger, X.min(), X.max())),
+                        en_yakin[2], en_yakin[3])
         return en_yakin[0], en_yakin[2], en_yakin[3]
 
     def _route_centers(self, lane_mask, da_mask):
@@ -1206,6 +1369,22 @@ class LaneDetectionNode(Node):
         açık zeminle birleşir, genişler ve merkezi kayar. Ekrandaki tek 'Merkez'
         sayısı bunu göstermiyor, bu tablo gösteriyor.
         """
+        # METRİK MOD KENDİ TANISINI BASAR. debug_rows yalnızca PİKSEL modunun
+        # fonksiyonlarında doldurulur; metrik modda o fonksiyonlar hiç
+        # çağrılmadığı için liste hep boş kalıyor ve bu satır her karede
+        # 'hiç satır ölçülemedi' diye bağırıyordu - ölçüm gayet çalışırken.
+        # Yanlış alarm, gerçek arızayı gizliyordu.
+        if self.route_source == 'mesafe':
+            m = self.son_mesafe_m
+            self.get_logger().info(
+                f'TANI (metrik): mesafe='
+                f'{"YOK" if m is None else f"{m:.2f} m"} | hedef '
+                f'{self.hedef_sag_mesafe_m:.2f} m | kaynak {self.debug_source} | '
+                f'kayip kare {self.lost_frames} | serit gecerli {self.lane_valid} | '
+                f'derinlik {"var" if self.depth_image is not None else "YOK"} | '
+                f'fx {"var" if self.fx is not None else "YOK"}')
+            return
+
         if not self.debug_rows:
             self.get_logger().info('TANI: hiç satır ölçülemedi')
             return

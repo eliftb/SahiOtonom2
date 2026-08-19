@@ -102,13 +102,21 @@ def kontrol(ad, kosul, detay):
 
 
 # --- 1) ŞERİT YOLU: yön kuralının kendisi ---------------------------------
-# Log biçimi: sapma > 0 = "SOL tarafta -> SAĞA". Sağ = byte MERKEZ'in üstü.
+# HANGİ BYTE FİZİKSEL OLARAK HANGİ TARAF - PİSTTE GÖZLE DOĞRULANDI (2026-08-19):
+# merkezin ÜSTÜNDEKİ byte (d > 230) tekeri SAĞA çeviriyor.
+# Bir ara tersi denendi (steering_direction +1.0) ve araç sağa kırması
+# gerekirken sola kırdı; gözlem bu yönü kesinleştirdi. Test yazılımın kendi
+# varsayımına göre değil BU ÖLÇÜME göre yazılır, yoksa kendi kendini doğrular.
+#
+# Donanım/kablolama değişirse burayı ve steering_direction'ı birlikte çevirin.
+SAG = lambda byte: byte > MERKEZ          # sağa kırmak = merkezin ÜSTÜ
+SOL = lambda byte: byte < MERKEZ
 sag = seritte_byte(+0.4)
 sol = seritte_byte(-0.4)
 kontrol('şerit: sapma>0 (araç solda) SAĞA kırar',
-        sag > MERKEZ, f'd,{sag} > {MERKEZ}')
+        SAG(sag), f'd,{sag} (sağ = >{MERKEZ})')
 kontrol('şerit: sapma<0 (araç sağda) SOLA kırar',
-        sol < MERKEZ, f'd,{sol} < {MERKEZ}')
+        SOL(sol), f'd,{sol} (sol = <{MERKEZ})')
 
 # --- 2) YÖN TUTMA YOLU: aynı fiziksel yön kuralına uymalı -----------------
 sola_byte, sola_hedef = kavsakta_byte(-1)      # -1 = SOLA emri
@@ -121,10 +129,10 @@ kontrol('kavşak: SAĞA emri hedef yönü -90° kaydırır',
         abs(math.degrees(saga_hedef) + 90.0) < 1.0,
         f'{math.degrees(saga_hedef):+.0f}°')
 
-kontrol('kavşak: SOLA emri SOLA kırar (eski hata: sağa kırıyordu)',
-        sola_byte < MERKEZ, f'd,{sola_byte} < {MERKEZ}')
+kontrol('kavşak: SOLA emri SOLA kırar',
+        SOL(sola_byte), f'd,{sola_byte} (sol = <{MERKEZ})')
 kontrol('kavşak: SAĞA emri SAĞA kırar',
-        saga_byte > MERKEZ, f'd,{saga_byte} > {MERKEZ}')
+        SAG(saga_byte), f'd,{saga_byte} (sağ = >{MERKEZ})')
 
 # --- 3) İKİ YOL BİRBİRİYLE TUTARLI ----------------------------------------
 # 'Sola git' iki yolda da merkezin AYNI tarafına düşmeli.
@@ -143,7 +151,7 @@ kontrol('kavşak: hedef yöne varınca direksiyon merkeze döner',
 # Hedefi AŞARSA ters yöne düzeltmeli (kapalı döngü olduğunun kanıtı)
 asti, _ = kavsakta_byte(-1, donuldu_rad=math.radians(110))
 kontrol('kavşak: hedefi aşarsa ters yöne düzeltir',
-        asti > MERKEZ, f'd,{asti} > {MERKEZ}')
+        SAG(asti), f'd,{asti} (ters yön = sağ = >{MERKEZ})')
 
 # --- RAPOR ---------------------------------------------------------------
 print()
