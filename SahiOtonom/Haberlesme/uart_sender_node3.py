@@ -33,8 +33,22 @@ except ImportError as _hata:
 # Düğümden BAĞIMSIZ tutuluyor çünkü dosyanın sonundaki kalibrasyon modu da aynı
 # eşlemeyi kullanıyor. Ölçüm ile sürüş aynı koddan geçmezse ikisi zamanla
 # ayrışır ve sehpada doğruladığın merkez pistte başka bir yere düşer.
-BYTE_MERKEZ = 180        # firmware protokolü: d,0-360. NOMİNAL merkez.
-BYTE_UST = 360
+# communication.ino'daki d komutu:
+#     if (deger < 0 || deger > 420) return;   // gecerli aralik
+#     int hedef = deger - 210;                // 210 = MERKEZ, birim = DERECE
+# Yani firmware'in merkezi 210, tavanı 420. Burada 180/360 yazıyordu: yazılım
+# "düz" derken porta d,180 gidiyordu, firmware bunu hedef = -30, yani 30 DERECE
+# SOL olarak uyguluyordu. Aracın sola çekmesinin kök sebebi buydu; steering_trim
+# ile üstü örtülmüştü (aşağıda o da düzeltildi). .ino'daki 210/420 değişirse
+# burası da değişmeli.
+BYTE_ALT = 0
+BYTE_MERKEZ = 210        # firmware protokolü: d,0-420. NOMİNAL merkez.
+BYTE_UST = 420
+# Firmware `int stepangle = 0` ile açılır, yani "ben d,210 konumundayım" sayar.
+# Step motor AÇIK DÖNGÜ: gerçek teker açısını bilmez, sadece ardışık iki komut
+# ARASINDAKİ farkı döner. Portu açmak Arduino'ya DTR reset attırdığı için her
+# bağlantıda bu varsayıma dönülür (bkz. _portu_ac).
+FIRMWARE_ACILIS_BYTE = 210
 
 
 def merkez_byte(steering_trim):
@@ -45,8 +59,8 @@ def merkez_byte(steering_trim):
 def yari_aralik(steering_trim):
     """Merkezden iki yana da gidilebilen byte miktarı.
 
-    Trim merkezi kaydırınca iki tarafın alanı eşitsizleşir (merkez 150 ise solda
-    150, sağda 210 birim kalır). Küçük tarafla sınırlamazsak araç sağa, sola
+    Trim merkezi kaydırınca iki tarafın alanı eşitsizleşir (merkez 230 ise solda
+    230, sağda 420-230 = 190 birim kalır). Küçük tarafla sınırlamazsak araç sağa, sola
     döndüğünden sert döner ve sebebi kırpmanın içinde görünmez kalır.
     """
     merkez = merkez_byte(steering_trim)
@@ -56,13 +70,13 @@ def yari_aralik(steering_trim):
 def aci_to_byte(angle_rad, steering_trim, max_steering_angle):
     """Direksiyon açısını firmware'in d aralığına çevirir.
 
-    Merkez = 180 + steering_trim; ±max_steering_angle o merkezden itibaren
+    Merkez = 210 + steering_trim; ±max_steering_angle o merkezden itibaren
     ±yari_aralik() birime düşer.
 
     ÖLÇEK max_steering_angle'DAN TÜRETİLİYOR (2026-08-18). Eskiden ±0.5 rad ↔
-    0-360 eşlemesi gömülüydü ama doyum sınırı ayrı bir değişkendi; ikisi
+    0-420 eşlemesi gömülüydü ama doyum sınırı ayrı bir değişkendi; ikisi
     tesadüfen 0.5'te eşit olduğu için sorun görünmüyordu. Gerçek kilit ölçülüp
-    max_steering_angle 0.35'e çekilseydi byte ancak 306'ya çıkacak, kilidin son
+    max_steering_angle 0.35'e çekilseydi byte ancak 357'ye çıkacak, kilidin son
     %15'i erişilemez olacaktı.
     """
     if max_steering_angle <= 0.0:
@@ -70,7 +84,7 @@ def aci_to_byte(angle_rad, steering_trim, max_steering_angle):
     angle_rad = max(-max_steering_angle, min(angle_rad, max_steering_angle))
     value = int(round(merkez_byte(steering_trim)
                       + angle_rad / max_steering_angle * yari_aralik(steering_trim)))
-    return max(0, min(value, BYTE_UST))
+    return max(BYTE_ALT, min(value, BYTE_UST))
 
 
 class UartSenderNode(Node):
@@ -84,10 +98,11 @@ class UartSenderNode(Node):
                                '/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0')
         self.declare_parameter('baud_rate', 38400)
 
-        # Her komutun sonuna '\n' konsun mu. AÇIK olmalı: kapalıyken komutlar
-        # porta ayraçsız akıyor ve firmware'in parseInt'i bir sonraki komutun
-        # harfini yutuyor (bkz. send_command). Kapatma seçeneği sadece
-        # firmware'in sonlandırıcıyı sevmediği ortaya çıkarsa diye var.
+        # Her komutun sonuna '\n' konsun mu. AÇIK olmalı: kapalıyken komut
+        # kaybolmaz ama GECİKİR - firmware bekleyeni ancak sonraki komut harfi
+        # gelince ya da akış 20 ms durunca uygular (bkz. send_command). Fren
+        # komutunun 160 ms'ye kadar beklemesi demek. Kapatma seçeneği sadece
+        # arızayı yeniden üretmek için duruyor.
         self.declare_parameter('satir_sonu', True)
 
         self.MIX_PORT = self.get_parameter('mix_port').value
@@ -185,17 +200,19 @@ class UartSenderNode(Node):
         # 180 arasındaki fark. Birim: d komutunun birimi. Araç SOLA çekiyorsa
         # artır (+5, +10...), SAĞA çekiyorsa azalt (-5, -10...). Merkez = 180+trim.
         #
-        # ÖLÇÜLDÜ (2026-08-18, sehpada): tekerler byte 230'da düz, yani merkez
-        # 180 DEĞİL. Aranan arıza buydu - yazılım "hafif sola kırıyorum" (byte
-        # 158-165) derken teker gerçek merkezin ~70 birim solunda duruyordu ve
-        # merkeze dönüş komutu (180) bile 50 birim soldaydı.
+        # ÖLÇÜLDÜ (2026-08-18, sehpada): tekerler byte 230'da düz. Nominal
+        # merkez 210 olduğuna göre trim = 230 - 210 = 20.
         #
-        # BEDELİ: merkez 230 olunca sağda sadece 130 birim yer kalıyor, iki taraf
-        # simetrik tutulduğu için kullanılabilir aralık ±180'den ±130'a düşüyor
-        # (yetkinin %28'i). Kalıcı çözüm MEKANİK: servo kolunu/çubuğu ortalayıp
-        # bu sayıyı birkaç birime indirmek. Ondan sonra tekrar ölçün:
+        # DEĞER 50'DEN 20'YE İNDİ (2026-08-20) ama tekerler AYNI yerde: merkez
+        # sabiti 180 iken 230'a varmak için 50 gerekiyordu, 210 olunca 20 yetiyor.
+        # Ölçüm değişmedi, sabit düzeldi.
+        #
+        # BEDELİ: merkez 230 olunca sağda 420-230 = 190 birim kalıyor, iki taraf
+        # simetrik tutulduğu için kullanılabilir aralık ±210'dan ±190'a düşüyor.
+        # Kalıcı çözüm MEKANİK: servo kolunu/çubuğu ortalayıp bu sayıyı birkaç
+        # birime indirmek. Ondan sonra tekrar ölçün:
         #     python3 uart_sender_node3.py --kalibrasyon
-        self.declare_parameter('steering_trim', 50)
+        self.declare_parameter('steering_trim', 20)
         # TAM KİLİT (rad). PID çıkışı buraya doyar VE angle_to_byte'ın ölçeği
         # budur: ±max_steering_angle, merkezden itibaren kullanılabilir byte
         # aralığının uçlarına düşer.
@@ -231,14 +248,16 @@ class UartSenderNode(Node):
         # önce gaz -> araç gerçekten ilerlemeye başlasın -> sonra şerit takibi.
         # Odometri bu kadar metre yol gördüğünde direksiyon devreye girer.
         # GAZ DEĞERİ. Yazılım 'ilerle' derken porta 'h,<bu değer>' yazar.
-        # 1 idi ve firmware bunu bir HIZ SEVİYESİ olarak okuyorsa (0-255 gibi)
-        # 1 neredeyse sıfır gaz demek: motor boşta döner ama araç yükü
-        # kaldıramaz - pistte tam bu görüldü (motor dönüyor, araç ilerlemiyor).
-        # Firmware sadece 0/1 bekliyorsa 1 doğru değerdir ve değiştirmeye gerek
-        # yoktur. .ino elimizde olmadığı için PİSTTE DENENİR:
-        #     ros2 param set /uart_sender_node hiz_degeri 50
-        #     ros2 param set /uart_sender_node hiz_degeri 150
-        # Araç hangi değerde kalkıyorsa o değeri buraya yazın.
+        #
+        # .ino GELDİ (2026-08-20) - SORU KAPANDI. Firmware tam olarak şunu yapar:
+        #     analogWrite(9, deger == 1 ? 134 : 0);
+        # Yani h SEVİYE DEĞİL, AÇ/KAPA. SADECE 1 gaz verir; 50, 150, 255 dâhil
+        # diğer HER değer gazı SIFIRLAR. Buradaki eski not "pistte 50/150
+        # deneyin" diyordu - o deneme aracı hiç kaldırmaz ve sebebi görünmezdi.
+        # 1'den farklı değer atanırsa aşağıda gürültülü uyarı basılır.
+        #
+        # GAZ SEVİYESİ DEĞİŞTİRİLECEKSE .ino'DAN: analogWrite'taki 134 (PWM,
+        # 0-255) değiştirilip Arduino'ya yeniden yüklenir. Python'dan olmaz.
         self.declare_parameter('hiz_degeri', 1)
         # GAZ TEKRAR HIZI (Hz). Gaz komutu artık /speed mesajına DEĞİL, sabit
         # bir zamanlayıcıya bağlı. Sebebi: /speed karar düğümünden geldiği
@@ -265,6 +284,14 @@ class UartSenderNode(Node):
         # yığılan trafik Arduino'nun giriş tamponunu taşırabilir; taşınca
         # komutlar bozulur ve gaz kesik alınır. 0 = sınırsız (her mesajda).
         self.declare_parameter('direksiyon_hz', 20.0)
+        # TEK KOMUTTA GİDİLECEK EN BÜYÜK DİREKSİYON ADIMI (byte).
+        # 'Kesik kesik gaz' arızasının asıl kapağı bu (ayrıntı: _direksiyon_gonder).
+        # Kısaca: firmware'in stepAt()'i derece başına ~17.8 ms BLOKLUYOR ve o
+        # sürede seri portu hiç okumuyor; 13.5 dereceden büyük tek hareket
+        # Arduino'nun 64 baytlık tamponunu taşırıyor, taşınca 'h,1' bozulup
+        # 'h,0' okunabiliyor ve gaz kesiliyor. 12 < 13.5, yani sınır kapalı.
+        # Yavaşlatmıyor: 20 Hz x 12 birim = 240 birim/sn, uçtan uca ~1.6 sn.
+        self.declare_parameter('direksiyon_max_adim_byte', 12)
         self.declare_parameter('hareket_esigi_m', 0.15)
         self.declare_parameter('straight_start_sec', 3.0)
 
@@ -282,9 +309,39 @@ class UartSenderNode(Node):
         self.max_steering_angle = float(self.get_parameter('max_steering_angle').value)
         self.straight_start_sec = self.get_parameter('straight_start_sec').value
         self.hiz_degeri = int(self.get_parameter('hiz_degeri').value)
+        if self.hiz_degeri != 1:
+            # Sessizce geçmiyoruz: porta 'h,50' yazmak loglarda GAZ VERİLDİ
+            # gibi görünür ama firmware analogWrite(9, 0) yapar. Aracın
+            # kalkmamasının sebebi gaz komutunun hiç gitmemesi sanılır.
+            self.get_logger().error(
+                f'⛔ hiz_degeri={self.hiz_degeri} - FIRMWARE BUNU GAZ SAYMAZ. '
+                f'communication.ino: analogWrite(9, deger == 1 ? 134 : 0) - '
+                f'sadece 1 gaz verir, diğer her değer gazı KESER. Gaz seviyesi '
+                f'için .ino icindeki 134 degistirilip yeniden yuklenmeli.')
         self.gaz_tekrar_hz = float(self.get_parameter('gaz_tekrar_hz').value)
+        # KALP ATIŞI FİRMWARE ZAMAN AŞIMINDAN HIZLI OLMALI: .ino'da
+        # KOMUT_ZAMAN_ASIMI_MS = 1000, yani 1 sn geçerli komut görmezse gazı
+        # kesip freni basıyor. Bu düğüm porta yazan TEK yer olduğu için
+        # zamanlayıcı yavaşlarsa araç kendi kendine frenler.
+        if self.gaz_tekrar_hz < 2.0:
+            if self.gaz_tekrar_hz > 0:
+                self.get_logger().warn(
+                    f'⚠️  gaz_tekrar_hz={self.gaz_tekrar_hz} çok düşük - firmware '
+                    f'1 sn sessizlikte gazı keser. 2.0 Hz yapıldı.')
+                self.gaz_tekrar_hz = 2.0
+            else:
+                self.get_logger().error(
+                    '⛔ gaz_tekrar_hz=0 - porta HİÇ gaz komutu gitmez '
+                    '(speed_callback yazmıyor, sadece saklıyor). 10.0 Hz yapıldı.')
+                self.gaz_tekrar_hz = 10.0
         self.direksiyon_hz = float(self.get_parameter('direksiyon_hz').value)
+        self.direksiyon_max_adim_byte = int(
+            self.get_parameter('direksiyon_max_adim_byte').value)
         self._son_direksiyon_zamani = 0.0
+        # Firmware'in inandığı direksiyon konumu. Açık döngü olduğu için
+        # kademeli yazımın referansı budur; porta d yazan tek yer
+        # _direksiyon_gonder ve orada güncellenir.
+        self._son_direksiyon_byte = FIRMWARE_ACILIS_BYTE
         # Zamanlayıcının tekrarlayacağı son gaz/fren değeri.
         # acilista_gaz True ise gaz basılı, fren serbest başlar (bkz. yukarısı).
         self.acilista_gaz = bool(self.get_parameter('acilista_gaz').value)
@@ -343,6 +400,14 @@ class UartSenderNode(Node):
         self.mix_serial = None
         self.port_hazir_zamani = 0.0     # Arduino açılışta reset atar, o kadar bekle
         self.baglanti_uyarildi = False
+        # PORTUN AÇILAMAMA SEBEBİ. Sebep eskiden SADECE İLK denemede
+        # loglanıyordu (baglanti_uyarildi bayrağı tekrarı bastırıyor); sonraki
+        # binlerce satırda yalnızca "PORT KAPALI" görünüyor, NEDEN görünmüyordu.
+        # Pistte log yukarı kaydırılamadığı için arıza "gaz kesiliyor" diye
+        # aranıyor, oysa sebep tek satırda yazılı: dosya yok mu, izin mi,
+        # yoksa portu başka bir süreç mi tutuyor. Sebebi saklayıp her
+        # "PORT KAPALI" satırında tekrar basıyoruz.
+        self._son_port_hatasi = 'henüz denenmedi'
         self._portu_ac(ilk=True)
         # GAZ İLK KOMUT OLSUN. Zamanlayıcıyı beklemeden burada yazıyoruz ki
         # porta giden ilk bayt gaz olsun. Arduino henüz reset'ten çıkmadıysa
@@ -396,7 +461,8 @@ class UartSenderNode(Node):
                    'steering_trim', 'max_steering_angle', 'straight_start_sec',
                    'heading_hold', 'kp_heading', 'heading_hold_max_sec',
                    'turn_angle_deg', 'satir_sonu', 'hareket_esigi_m',
-                   'hiz_degeri', 'gaz_tekrar_hz', 'direksiyon_hz', 'acilista_gaz')
+                   'hiz_degeri', 'gaz_tekrar_hz', 'direksiyon_hz', 'acilista_gaz',
+                   'direksiyon_max_adim_byte')
 
     def _on_parameter_update(self, params):
         for p in params:
@@ -407,6 +473,14 @@ class UartSenderNode(Node):
                 if p.name in ('kp', 'ki', 'kd'):
                     self.integral = 0.0   # kazanç değişince eski birikim anlamsız
                     self.d_filtered = 0.0
+                if p.name == 'hiz_degeri' and self._son_hiz:
+                    # HEMEN ETKİ ETSİN. Porta yazılan _son_hiz yalnız
+                    # speed_callback'te kuruluyordu; yani 'ros2 param set
+                    # hiz_degeri 150' ancak bir sonraki /speed mesajıyla
+                    # geçiyor, /speed hiç akmıyorsa HİÇ geçmiyordu. Araç zaten
+                    # gaz basılıysa (_son_hiz != 0) yeni değeri anında kullan;
+                    # gaz kesikse (0) dokunma - fren kararı karar düğümünündür.
+                    self._son_hiz = self.hiz_degeri
                 self.get_logger().info(f'⚙️  {p.name} = {getattr(self, p.name)}')
         return SetParametersResult(successful=True)
 
@@ -421,6 +495,12 @@ class UartSenderNode(Node):
         try:
             self.mix_serial = serial.Serial(self.MIX_PORT, self.BAUD_RATE, timeout=0.1)
             self.port_hazir_zamani = time.time() + 3.0
+            # PORT AÇMAK ARDUINO'YA DTR RESET ATTIRIR: firmware stepangle=0'a,
+            # yani "d,210'dayım"a döner. Bizim saydığımız konumu da oraya
+            # çekmezsek ilk kademeli hareket tekerleri bambaşka bir yere götürür.
+            # (Bu YAZILIMSAL hizalama - tekerler fiziksel olarak kaldıkları
+            # yerde durur; sehpada elle ortalamak farkı kapatır.)
+            self._son_direksiyon_byte = FIRMWARE_ACILIS_BYTE
             self.baglanti_uyarildi = False
             # Güç kesilip gelmişse eski PID birikimi anlamsız
             self.integral = 0.0
@@ -436,6 +516,7 @@ class UartSenderNode(Node):
             return True
         except Exception as e:
             self.mix_serial = None
+            self._son_port_hatasi = f'{type(e).__name__}: {e}'
             if not self.baglanti_uyarildi:
                 self.baglanti_uyarildi = True    # her 2 sn'de bir log basmasın
                 self.get_logger().error(
@@ -462,26 +543,19 @@ class UartSenderNode(Node):
     def send_command(self, prefix, value):
         """Mix porta 'harf,değer\\n' formatında komut gönderir (örn: h,1  f,0  d,127).
 
-        SONLANDIRICI ZORUNLU (2026-08-18'de eklendi - "hız komutu gidiyor ama
-        araç gitmiyor" arızasının sebebi buydu). Eskiden komutlar ayraçsız
-        yazılıyordu, yani porta kesintisiz şu akış gidiyordu:
+        SONLANDIRICILI (2026-08-18'de eklendi). Her komutun sonuna '\\n'
+        konur; firmware onu görünce komutu ANINDA uygular:
+            else if (c == '\\n' || c == '\\r') { komutUygula(); }
 
-            d,230d,230h,1f,0d,230...
+        NEDEN ÖNEMLİ - GECİKME. Sonlandırıcı olmasa da komut kaybolmaz:
+        firmware bekleyen komutu (a) bir sonraki komut harfi gelince, (b) akış
+        20 ms durunca uyguluyor. Ama o zaman FREN komutu bir sonraki komuta
+        kadar bekler - 20 Hz akışta 50 ms, direksiyon bloklarken 160 ms'ye
+        kadar. Acil durdurmada bu gecikmenin bedeli var.
 
-        Firmware Serial.parseInt() kullanıyorsa sayıyı BİTİREN karakteri okuyup
-        ATAR. Yukarıdaki akışta 230'u bitiren karakter bir sonraki komutun
-        HARFİDİR: 'd' sayısını okuyan parseInt arkasından gelen 'h'yi yutuyor,
-        geride kalan ',1' harfsiz kaldığı için yok sayılıyordu. Direksiyon (d)
-        ve fren (f) geçiyor, HIZ (h) hiç ulaşmıyordu - loglarda 'h,1' görünmesine
-        rağmen araç hareket etmiyordu.
-
-        Kalibrasyon modunda gizli kalmasının sebebi: orada komutlar tuş tuş,
-        aralarında saniyeler geçerek gidiyor. Akış durunca parseInt kendi
-        zaman aşımıyla sayıyı bitiriyor, sonraki harfi yutmuyor. Arıza SADECE
-        sürüşteki 20 Hz kesintisiz akışta ortaya çıkıyor.
-
-        Firmware'in \\n'i sevmediği ortaya çıkarsa pistte kapatılabilir:
-            ros2 param set /uart_sender_node satir_sonu false
+        (Bu docstring eskiden Serial.parseInt'in sonraki komutun harfini
+        yuttuğunu anlatıyordu; .ino 2026-08-20'de görülünce yanlış olduğu
+        anlaşıldı - firmware parseInt kullanmıyor, karakter karakter okuyor.)
         """
         # SESSİZ DÜŞME GÖRÜNÜR OLMALI. speed_callback / lateral_callback log
         # satırını send_command'dan SONRA basıyor ve bu fonksiyon port kapalıyken
@@ -496,7 +570,11 @@ class UartSenderNode(Node):
                 self.get_logger().error(
                     f'⛔ PORT KAPALI - komutlar gönderilmiyor ({self._dusen_komut} '
                     f'komut düştü). Loglardaki "Sinyal: h,1" satırları porta '
-                    f'ULAŞMIYOR. Arduino bağlı mı: ls /dev/serial/by-id/')
+                    f'ULAŞMIYOR.\n'
+                    f'   Port : {self.MIX_PORT}\n'
+                    f'   Sebep: {self._son_port_hatasi}\n'
+                    f'   Teşhis: ls -l /dev/serial/by-id/   (yol var mı)\n'
+                    f'           fuser -v {self.MIX_PORT}    (başka süreç mi tutuyor)')
             return
         if time.time() < self.port_hazir_zamani:
             return          # Arduino henüz reset'ten çıkmadı
@@ -780,18 +858,27 @@ class UartSenderNode(Node):
             simdi = time.time()
             if simdi - getattr(self, '_bekleme_logu', 0.0) > 1.0:
                 self._bekleme_logu = simdi
+                # GAZIN GERÇEKTEN AKIP AKMADIĞI DA YAZILSIN. Odometri eşiği
+                # bekleyen dal, gaz hiç verilmiyorsa SONSUZA KADAR bekler:
+                # araç ilerlemez -> eşik geçilmez -> direksiyon hiç devreye
+                # girmez. Bu kilidin dışarıdan tek belirtisi 'BEKLEMEDE'
+                # satırının hiç bitmemesiydi ve sebebi bu düğümde değil,
+                # karar düğümünün /speed 0 yayınlamasındaydı.
+                gaz_durumu = (f'gaz h,{self._son_hiz} f,{self._son_fren}'
+                              if self._son_hiz else
+                              f'⚠️ GAZ YOK (h,{self._son_hiz} f,{self._son_fren}) '
+                              f'- /speed 0 geliyor, sebebi karar düğümünde')
                 self.get_logger().info(
                     f'⏸️  Direksiyon BEKLEMEDE - araç henüz '
-                    f'{self.hareket_esigi_m:.2f} m ilerlemedi '
-                    f'(gaz veriliyor, hareket bekleniyor).'
+                    f'{self.hareket_esigi_m:.2f} m ilerlemedi | {gaz_durumu}'
                     if odometri_var else
-                    '⏸️  Direksiyon BEKLEMEDE - düz başlangıç fazı.')
+                    f'⏸️  Direksiyon BEKLEMEDE - düz başlangıç fazı | {gaz_durumu}')
             self.integral = 0.0
             self.prev_error = 0.0
             self.d_filtered = 0.0
             # Faz bitince ilk türev adımı bu bekleme süresini dt sanmasın
             self.last_pid_time = None
-            self.send_command('d', self.angle_to_byte(0.0))
+            self._direksiyon_gonder(self.angle_to_byte(0.0))
             return
         if not self.straight_phase_done:
             self.straight_phase_done = True
@@ -803,8 +890,7 @@ class UartSenderNode(Node):
 
         if yon_acisi is not None:
             steering_angle = yon_acisi
-            angle_byte = self.angle_to_byte(steering_angle)
-            self.send_command('d', angle_byte)
+            angle_byte = self._direksiyon_gonder(self.angle_to_byte(steering_angle))
             hata_derece = math.degrees(math.atan2(
                 math.sin(self.hedef_yaw - self.guncel_yaw),
                 math.cos(self.hedef_yaw - self.guncel_yaw)))
@@ -824,8 +910,8 @@ class UartSenderNode(Node):
             self._son_direksiyon_zamani = simdi
 
         self._son_direksiyon_acisi = steering_angle
-        angle_byte = self.angle_to_byte(steering_angle)
-        self.send_command('d', angle_byte)   # d -> direksiyon
+        # KADEMELİ: hedefe tek hamlede değil, tampon taşırmayan adımlarla gidilir
+        angle_byte = self._direksiyon_gonder(self.angle_to_byte(steering_angle))
         self.get_logger().info(f'🎯 LATERAL KONTROL | Dev: {self.current_lateral_deviation:.3f} | '
                              f'Steering: {steering_angle:.3f} rad | Byte: d,{angle_byte} | '
                              f'Durum: {"SAĞ tarafta→SOLA" if self.current_lateral_deviation < 0 else "SOL tarafta→SAĞA" if self.current_lateral_deviation > 0 else "MERKEZ"}')
@@ -833,10 +919,53 @@ class UartSenderNode(Node):
     def speed_to_digital_signal(self, speed_ms):
         """Gelen hıza göre porta yazılacak h değeri: hiz_degeri (git) ya da 0 (dur).
 
-        hiz_degeri varsayılan 1'dir, yani eski davranış. Firmware h'yi bir hız
-        SEVİYESİ olarak okuyorsa 1 yetmeyebilir (bkz. parametre notu).
+        FIRMWARE SADECE 1 KABUL EDER: analogWrite(9, deger == 1 ? 134 : 0).
+        hiz_degeri 1 dışında bir şeye çekilirse burası gaz gibi görünen ama
+        firmware'de 0'a düşen bir değer üretir (bkz. parametre notu).
         """
         return self.hiz_degeri if speed_ms > 0.1 else 0
+
+    def _direksiyon_gonder(self, hedef_byte):
+        """Direksiyon byte'ını KADEMELİ yazar ve GERÇEKTEN yazılan değeri döner.
+
+        NEDEN VAR - "kesik kesik gaz" arızasının sebebi buydu:
+
+        communication.ino'daki stepAt() BLOKLAYAN bir döngü. Adım başına
+        2 x delayMicroseconds(1000) = 2 ms, derece başına 3200/360 = 8.89 adım,
+        yani derece başına ~17.8 ms. O süre boyunca Arduino
+        'while (Serial.available())' döngüsüne HİÇ dönmüyor - gelen baytlar
+        64 baytlık donanım tamponunda birikiyor.
+
+        Porta akan trafik en kötü hâlde ~266 bayt/sn (d 31 Hz x 6 bayt +
+        h 10 Hz x 4 + f 10 Hz x 4). Tampon 64 / 266 = 0.24 saniyede doluyor,
+        bu da 0.24 / 0.0178 = ~13.5 DERECE demek: tek komutta bundan büyük her
+        direksiyon hareketi tamponu taşırıyor.
+
+        Taşınca akışın ortasından bayt düşüyor ve komutlar birbirine karışıyor.
+        'h,1\nf,0\n' akışından bayt kaybolunca firmware'in gördüğü şey 'h,0'
+        olabiliyor - ve firmware:
+            analogWrite(9, deger == 1 ? 134 : 0);
+        deger 1 DEĞİLSE gazı sıfırlıyor. Yani her sert direksiyon hareketi
+        gazı bir anlığına kesiyordu; komut akışında hiçbir hata görünmüyordu
+        çünkü Python doğru baytları yazmıştı, kaybolan yer Arduino'nun tamponu.
+
+        Sınırı 13.5'in altında tutmak taşmayı tamamen kapatır. Hedefe birkaç
+        komutta yaklaşmak direksiyonu yavaşlatmıyor: 20 Hz x 12 birim =
+        240 birim/sn. Kullanılabilir aralık trim 20'de ±190, yani uçtan uca
+        380 birim -> ~1.6 saniye. (Tavan 360'tan 420'ye çıkınca bu sayı 260'tan
+        380'e yükseldi; süre 1.1 sn'den 1.6 sn'ye çıktı ama o hareket sürüşte
+        hiç istenmiyor - PID uçtan uca atlamaz.)
+        """
+        # 0/negatif sınır düğümü kilitlemesin: en az 1 birim ilerlensin.
+        adim = max(1, int(self.direksiyon_max_adim_byte))
+        fark = hedef_byte - self._son_direksiyon_byte
+        if fark > adim:
+            hedef_byte = self._son_direksiyon_byte + adim
+        elif fark < -adim:
+            hedef_byte = self._son_direksiyon_byte - adim
+        self._son_direksiyon_byte = hedef_byte
+        self.send_command('d', hedef_byte)
+        return hedef_byte
 
     def angle_to_byte(self, angle_rad):
         """Direksiyon açısını firmware'in d aralığına çevirir.
@@ -942,7 +1071,7 @@ class _KalibrasyonPortu:
     def kapat(self, park_byte=None):
         """Çıkarken tekerleri GERÇEK merkeze park eder.
 
-        Nominal 180'e park etmek trim ölçüldükten sonra yanlış: tekerleri
+        Nominal 210'a park etmek trim ölçüldükten sonra yanlış: tekerleri
         kalibrasyonun bulduğu düz konumdan trim kadar uzağa bırakırdı.
         """
         try:
@@ -997,9 +1126,9 @@ def _kodda_yazan(ad, varsayilan):
 def _kalibrasyon_merkez_bul(port, trim=0):
     """Tuşla byte'ı kaydırıp tekerlerin GERÇEKTEN düz olduğu değeri bulur.
 
-    KODDA YAZILI merkezden başlar, 180'den değil: merkez bir kez ölçüldükten
+    KODDA YAZILI merkezden başlar, 210'dan değil: merkez bir kez ölçüldükten
     sonra iş onu itme testiyle bir-iki birim hassaslaştırmaya döner ve her
-    seferinde 180'den başlamak o ayarı sıfırdan aratırdı.
+    seferinde 210'dan başlamak o ayarı sıfırdan aratırdı.
     """
     deger = port.gonder(merkez_byte(trim))
     print(f"""
@@ -1009,14 +1138,16 @@ def _kalibrasyon_merkez_bul(port, trim=0):
     ← / a   1 birim sol        → / d   1 birim sağ
     A       10 birim sol       D       10 birim sağ
     0       kodda yazılı merkeze dön
-    q / e   uca git (0 / 360) - dönüyor mu diye bak
+    q       uca git ({BYTE_ALT}) - dönüyor mu diye bak
+    e       uca git ({BYTE_UST}) - dönüyor mu diye bak
     n       satır sonu (\\n) aç/kapa - şu an: {'AÇIK' if port.satirsonu else 'KAPALI'}
     m       BURASI DÜZ -> ölç ve bitir
     x       kaydetmeden çık
 """)
     adimlar = {'a': -1, '\x1b[D': -1, 'd': +1, '\x1b[C': +1, 'A': -10, 'D': +10}
     while True:
-        print(f'\r  byte = {deger:3d}   (180\'e göre {deger - BYTE_MERKEZ:+d})   ',
+        print(f'\r  byte = {deger:3d}   (merkez {BYTE_MERKEZ}\'e göre '
+              f'{deger - BYTE_MERKEZ:+d})   ',
               end='', flush=True)
         t = _kalibrasyon_tus_oku()
         if t in adimlar:
@@ -1024,7 +1155,7 @@ def _kalibrasyon_merkez_bul(port, trim=0):
         elif t == '0':
             deger = merkez_byte(trim)
         elif t == 'q':
-            deger = 0
+            deger = BYTE_ALT
         elif t == 'e':
             deger = BYTE_UST
         elif t == 'n':

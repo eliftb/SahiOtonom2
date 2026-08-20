@@ -18,7 +18,7 @@ NODE_LAUNCH_ORDER = [
     },
     {
         "name": "HABERLEŞME (UART) - AVOIDANCE",
-        "file_path": "/home/sahi/SahiOtonom/Haberlesme/uart_sender_node_avoidance.py", # <-- GÜNCEL AVOIDANCE VERSIYONU
+        "file_path": "/home/sahi/SahiOtonom/Haberlesme/uart_sender_node3.py", # <-- TEK UART DOSYASI (avoidance surumu kaldirildi)
         "delay_after": 2
     },
     {

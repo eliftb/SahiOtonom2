@@ -89,8 +89,16 @@ class DecisionMakingNode(Node):
         # slow_down_distance ise hiç kullanılmıyordu.
         # Yeni davranış: 5 m'den itibaren HER METREDE bir kademe yavaşla,
         # 1.5 m'de tam dur.
-        self.declare_parameter('emergency_stop_distance', 1.5)
-        self.declare_parameter('slow_down_distance', 5.0)
+        # 1.5 -> 2.0 (2026-08-19): araç engele 2 m kala TAM DURUR.
+        # EngelTespit/engel-tespit.py içindeki stop_distance_m ile aynı tutun.
+        self.declare_parameter('emergency_stop_distance', 2.0)
+        # KADEMELİ YAVAŞLAMA KALDIRILDI (2026-08-19). Davranış artık ikili:
+        # 2 m'ye kadar TAM HIZ, 2 m ve altında TAM DURUŞ. Aradaki
+        # %80/%60/%40 kademeleri yok.
+        # Aşağıdaki iki parametre yalnız GERİ DÖNÜŞ için duruyor; kademeli
+        # yavaşlamayı geri istersen slow_down_distance'ı duruş mesafesinden
+        # BÜYÜK bir değere çek (örn. 5.0), rampa kendiliğinden geri gelir.
+        self.declare_parameter('slow_down_distance', 2.0)
         # Yavaşlama kademesinin boyu (metre)
         self.declare_parameter('slow_down_step_m', 1.0)
 
@@ -358,20 +366,21 @@ class DecisionMakingNode(Node):
         return steering_angle
 
     def engel_hiz_carpani(self, mesafe):
-        """Engel mesafesine göre hız çarpanı (0.0 - 1.0), METRE KADEMELİ.
+        """Engel mesafesine göre hız çarpanı (0.0 - 1.0).
 
-        5 m ve ötesi  -> 1.00 (tam hız)
-        4.0 - 5.0 m   -> 0.80
-        3.0 - 4.0 m   -> 0.60
-        2.0 - 3.0 m   -> 0.40
-        1.5 - 2.0 m   -> 0.20
-        1.5 m ve altı -> 0.00 (dur)
+        VARSAYILAN DAVRANIŞ - İKİLİ (2026-08-19'da kademeli yavaşlamanın
+        yerine geçti):
+            2 m'den uzak  -> 1.00 (tam hız)
+            2 m ve altı   -> 0.00 (tam duruş)
 
-        Sürekli bir rampa yerine kademe kullanılıyor: LiDAR mesafesi kare kare
+        slow_down_distance duruş mesafesinden BÜYÜK yapılırsa eski kademeli
+        rampa geri gelir: her slow_down_step_m metrede bir kademe.
+        Sürekli rampa yerine kademe kullanılır, çünkü LiDAR mesafesi kare kare
         birkaç santim oynuyor ve sürekli rampa gaz komutunu titretiyor.
         """
         if mesafe <= self.EMERGENCY_STOP_DISTANCE:
             return 0.0
+        # Rampa kapalı (slow_down_distance <= duruş mesafesi): ikili davranış.
         if mesafe >= self.SLOW_DOWN_DISTANCE:
             return 1.0
         adim = max(self.SLOW_DOWN_STEP_M, 0.1)

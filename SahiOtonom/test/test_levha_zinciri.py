@@ -222,8 +222,11 @@ def test_tuketiciler():
     m = re.search(r"declare_parameter\('route_source',\s*'(\w+)'\)", serit)
     kaynak = m.group(1) if m else '?'
     kullanim = re.findall(r'self\.preferred_side\b', serit)
+    # Imzaya DEGIL cagriya bak: _mesafe_sapmasi'nin parametreleri degisince
+    # (2026-08-20'de da_mask eklendi) duz metin eslesmesi sessizce kayboluyor ve
+    # test gercek sorunu bulmadigi halde GECIYOR.
     metrik_erken_return = "if self.route_source == 'mesafe':" in serit and \
-                          'return self._mesafe_sapmasi(lane_mask)' in serit
+                          re.search(r'return self\._mesafe_sapmasi\(', serit) is not None
     olu = kaynak == 'mesafe' and metrik_erken_return
     bildir(not olu,
            f"koridor tercihi (/route/preferred_side) surus yolunda tuketiliyor "

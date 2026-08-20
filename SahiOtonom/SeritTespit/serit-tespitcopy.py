@@ -56,10 +56,6 @@ class LaneDetectionNode(Node):
         self.publisher = self.create_publisher(Image, 'lane_detection_output', 10)
         self.lateral_pub = self.create_publisher(Float32, '/lane/lateral_deviation', 10)
         self.intersection_pub = self.create_publisher(Int32, '/lane/intersection_direction', 10)
-        # KALİBRASYON İÇİN: rota merkezinin HAM piksel konumu. Ekrandaki "Merkez"
-        # sayısıyla aynı şey ama okunabilir/ölçülebilir hâlde - camera_center_offset_px
-        # kalibrasyonu bunu kullanır (bkz. kalibrasyon_kamera.py). Sadece yayın,
-        # kontrol yolunu etkilemez.
         self.center_px_pub = self.create_publisher(Float32, '/lane/center_px', 10)
         # ŞERİT GEÇERLİ Mİ. Kavşakta şerit çizgileri biter; rota o birkaç metre
         # boyunca ölçüme değil tahmine dayanır ve araç savrulur. UART düğümü bu
@@ -156,7 +152,7 @@ class LaneDetectionNode(Node):
         # yanlış - ikincisinde şerit ihlali an meselesidir.
         # ŞERİT GENİŞLİĞİ (m) - ÖLÇÜLDÜ: 3.0. Referansın yan şeridin
         # çizgisine kaymasını yakalamak için gerekli (bkz. _mesafe_sapmasi).
-        self.declare_parameter('serit_genisligi_m', 0.0)   # 0 = serit gecis tespiti KAPALI
+        self.declare_parameter('serit_genisligi_m', 3.0)   # 0 = serit gecis tespiti KAPALI
         self.declare_parameter('merkez_bandi_m', 0.5)
         self.declare_parameter('kenar_kazanci', 1.0)   # 1.0 = KAPALI (dogrusal, sabahki gibi)
         # MAKULLÜK BANDI AÇILDI (2026-08-19, "1.5 metreyi referans alsın").
@@ -171,6 +167,15 @@ class LaneDetectionNode(Node):
         self.declare_parameter('mesafe_alt_sinir_m', 0.5)
         self.declare_parameter('mesafe_ust_sinir_m', 2.5)
         self.declare_parameter('mesafe_sicrama_esigi_m', 0.8)
+        # AYNI ÇİZGİ Mİ? Örnekleme satırları BİRBİRİNDEN BAĞIMSIZ ölçüyor: biri
+        # gerçek şerit çizgisini, diğeri saha kenarını/bariyeri yakalayabiliyor.
+        # En yakın adaydan bu kadar UZAKTAKİ adaylar başka bir cisim sayılır ve
+        # ölçüme hiç karıştırılmaz. Gerçek bir şerit çizgisinin yanal mesafesi
+        # satırdan satıra bu kadar oynamaz; virajdaki gerçek değişimi zaten
+        # aşağıdaki doğru uydurma modelliyor.
+        # Şerit genişliğinin (3.0 m) YARISINDAN küçük tutun: komşu şeridin
+        # çizgisi tam bir şerit genişliği ötede, tolerans oraya ulaşmamalı.
+        self.declare_parameter('ayni_cizgi_tol_m', 1.0)
         # KİLİT KAÇ KARE SONRA AÇILIR. Sıçrama koruması reddettiği karede
         # son_mesafe_m'i KORUYOR; araç gerçekten yer değiştirdiyse referans
         # DONUYOR ve ondan sonraki her ölçüm o bayat değere göre reddediliyor.
@@ -178,7 +183,20 @@ class LaneDetectionNode(Node):
         # 75'i böyle elendi ve /lane/valid False'a düşüp araç 'şerit yok'
         # moduna geçti. Bu kadar kare üst üste aynı yönde ölçüm geliyorsa
         # sıçrama değil GERÇEK hareket demektir; referans yenilenir.
-        self.declare_parameter('mesafe_sicrama_kabul_kare', 9999)   # 9999 = kilit acilmaz (sabahki)
+        # 9999 -> 8 (2026-08-19): 9999 bu valfi TAMAMEN kapatıyordu, yani
+        # yukarıda anlatılan arıza hâlâ aktifti. Pist koşusunda gerçekleşti:
+        # 'kaynak mesafe-sicrama | kayip kare 156 | serit gecerli False' -
+        # kilit 156 kare (~10 sn) boyunca kapalı kaldı, /lane/valid False'ta
+        # takıldı ve uart düğümü bütün koşu boyunca 'YÖN TUTMA (şerit yok)'
+        # yaptı. Oysa yolda şerit VARDI ve ölçüm (2.34 m) makul bandın
+        # (0.5-2.5 m) içindeydi; sadece donmuş referanstan 0.8 m'den fazla
+        # uzak olduğu için her karede reddediliyordu.
+        # 8 SEÇİLDİ, gecerlilik_kayip_kare'den (12) KÜÇÜK olsun diye: kilit,
+        # /lane/valid False'a düşmeden ÖNCE açılır, yani bu arıza bir daha
+        # aracı 'şerit yok' moduna sokamaza yetiyor.
+        # Büyütmek koruma süresini uzatır ama 12'yi geçers. ~17 FPS'te 8 kare ≈ 0.5 sn:
+        # gerçek bir yanlış-çizgi sıçramasını savuşturmaye arıza geri gelir.
+        self.declare_parameter('mesafe_sicrama_kabul_kare', 8)
 
         # /lane/valid NE ZAMAN False OLMALI. UART düğümü bu bayrağı görünce
         # şerit takibini TAMAMEN bırakıp odometriyle düz gidiyor (kavşak
@@ -219,48 +237,14 @@ class LaneDetectionNode(Node):
         # eşleşme aracı bir anda parkurdan çıkaramasın. Kare başına sınır,
         # model yavaşladığında (düşük FPS) viraja girişi geciktiriyordu.
         self.declare_parameter('max_deviation_rate', 2.5)
-        # VİRAJ İLERİ BESLEMESİ. Yanal sapma tek başına bir GECİKMELİ ölçüdür:
-        # araç viraja girip şeridin dışına çıkmaya başlamadan büyümez, o yüzden
-        # araç virajı geniş alır. Bu terim şeridin ileride NEREYE gittiğine bakar
-        # (uzak satır ile yakın satırın farkı) ve direksiyonu erken çevirir.
-        # Düz yolda bu fark ~0'dır, yani düz gidişi bozmaz.
-        #
-        # 1.0'dan 0.5'e indirildi (2026-08-17): ileri bakış 0.80'den 0.68'e
-        # çıkınca cross_track virajın çok daha büyük bölümünü kendisi yakalıyor
-        # (aynı virajda ölçüm: -0.093 -> -0.247), ikisi üst üste binince orta bir
-        # virajda direksiyon tavana dayanıyordu. Toplam agresiflik eskisiyle
-        # aynı kaldı, ama artık ağırlık sezgisel terimde değil GERÇEK geometride.
         # (Pistte 0.5 yerine 0.6 ile sürüldü; sabitlenen değer o.)
         self.declare_parameter('curve_feedforward', 0.6)
-        # Yaklaşık ufuk çizgisi (şerit genişliğinin perspektifle küçülme modeli)
-        # UFUK ÇİZGİSİ (kaybolma noktası). Şerit genişliğinin perspektifle
-        # küçülme modeli buna dayanır: genislik ~ (y - ufuk). Yanlışsa yakın
-        # satırlara UZATMA patlar. GERÇEK KAYITTAN ÖLÇÜLDÜ (pist_20260818_111612,
-        # test/kayit_analiz.py): y=460'ta 400 px, y=432'de 348 px çift ->
-        # ufuk y=245, yani 0.34. Kodda 0.55 yazıyordu ve o değerle y=576 için
-        # beklenen genişlik 1125 px (görüntü 1280 px!) çıkıyordu; tek çizgi
-        # görülen satırlarda merkez 'çizgi ± 562 px' diye kurulup bir şerit
+        
         # öteye fırlıyordu - aracın şerit değiştirmesinin sebebi buydu.
         self.declare_parameter('horizon_frac', 0.512)
-        # BEKLENEN ŞERİT GENİŞLİĞİ: 0.85 satırında görüntü genişliğinin kaçta kaçı.
-        # Bulunan iki çizgi arasındaki mesafe bununla karşılaştırılıp mantıksızsa
-        # reddediliyor - BARİYERLERİ ELEYEN TEK MEKANİZMA bu. Yanlışsa ya bariyer
-        # çifti "şerit" sayılır, ya da gerçek şerit reddedilir.
-        # ÖLÇÜM: debug_rows_log açıkken tablodaki 'gen' sütunu, y=0.85*yükseklik
-        # satırında kaç piksel? Onu görüntü genişliğine bölün.
         # ✓ kayıttan doğrulandı (0.395)
         self.declare_parameter('lane_width_frac', 0.40)
-        # Şerit çizgisi noktalarını SÜRÜLEBİLİR ALANIN İÇİNDE olanlarla sınırla.
-        # Bariyer/korkuluk alanın dışında kaldığı için bu filtre onları eler.
-        # Kapatmak, modelin bulduğu her çizgiyi kabul etmek demektir.
         self.declare_parameter('paint_inside_only', True)
-        # YAN ŞERİDE KAYMAYI ÖNLEME. Sürülebilir alan yandaki kola bitişikse
-        # aralarında boşluk olmadığı için tek geniş parça görünür; koridorun
-        # orta noktası o kola doğru kayar ve araç "düz mü, yandaki şeride mi"
-        # arasında kararsız kalır. Ölçülen koridor, öğrenilen genişliğin bu
-        # katından genişse yan kol açılmış sayılır: genişlik korunur, rota
-        # sürekli kalan kenara sabitlenir. Mecburi dönüş varken (preferred_side)
-        # bu kilit BİLEREK devre dışı - dönüşte yan kola çıkmak gerekiyor.
         self.declare_parameter('corridor_widen_tol', 1.35)
         # Koridor parçası referanstan bu kadar uzaktaysa (görüntü genişliğinin
         # oranı) o satır ölçülmez. Yolun yanındaki alakasız sürülebilir alana
@@ -274,53 +258,13 @@ class LaneDetectionNode(Node):
         # 0.5 = yeni ölçüm yarı ağırlıkla karışır. Yükseltmek kararlılığı
         # artırır ama viraja tepkiyi geciktirir.
         self.declare_parameter('route_smoothing', 0.5)
-        # ŞERİT KİMLİĞİ KİLİDİ. İzlenen sol/sağ çizgi konumları sınırsız
-        # güncelleniyordu: kesikli çizgide ya da tek karelik yanlış eşleşmede
-        # iz yavaşça YAN ŞERİDİN çizgisine yürüyebiliyor, araç da şerit
-        # değiştiriyordu.
-        #
-        # Sınır ŞERİT GENİŞLİĞİNİN oranıdır, görüntü genişliğinin değil:
-        # engellenmek istenen şey "yan şeridin çizgisine atlamak" ve o çizgi
-        # tam bir şerit genişliği uzakta. Görüntü oranına bağlamak (0.04 =
-        # 51 px) arama penceresinin (102 px) yarısı kadar kalıyordu; araç
-        # hareket ederken iz geride kalıp yedek yola düşüyor, yani kilit
-        # tam da önlemek istediği hatayı tetikleyebiliyordu.
         self.declare_parameter('max_line_jump_frac', 0.40)
-        # ŞERİT GENİŞLİĞİNİ KENDİ ÖĞREN. lane_width_frac elle ölçülmesi gereken
-        # bir tahmindi ve yanlış olduğunda aracın KENDİ şeridinin çizgi çifti
-        # "genişlik mantıksız" diye reddediliyor, merkez tek çizgiden yanlış
-        # kuruluyor ve araç yan şeride itiliyordu. Oysa doğru genişlik zaten
-        # her karede ölçülüyor: yeterli örnek birikince MEDYANI kullanmak,
-        # elle girilen tahminden hem daha doğru hem de bakım gerektirmez.
-        # (Medyan, arada karışan yanlış çiftlere karşı dayanıklıdır.)
         self.declare_parameter('auto_lane_width', True)
         self.declare_parameter('auto_lane_width_min_samples', 15)
-        # FİZİKSEL SINIRLAR (0.85 satırına normalize, görüntü genişliğinin oranı).
-        # Önyükleme sırasında mantıklılık kapısı kapalı olduğu için SAÇMA çiftler
-        # de öğrenilebiliyordu: gerçek kayıtta öğrenilen genişlik 1320 px çıktı -
-        # görüntü 1280 px, yani en soldaki çizgi en sağdakiyle eşleşmiş. Bir
-        # şerit görüntüden geniş olamaz; bu aralık dışındaki ölçüm hiç sayılmaz.
         self.declare_parameter('lane_width_min_frac', 0.10)
         self.declare_parameter('lane_width_max_frac', 0.70)
-        # GÖRSELLEŞTİRME BÜTÇESİ. Debug karesi sadece insan için; kontrol yolunda
-        # değil. Maskeleri tam çözünürlükte her karede basmak ölçümde ~145 ms
-        # tutuyordu (maske ne kadar çok pikseli kaplarsa o kadar yavaş - yol
-        # kareyi doldurunca FPS 9'dan 3.3'e düşmesinin sebebi buydu).
-        # 0 = debug görüntüsü hiç üretilmesin (en hızlı).
         self.declare_parameter('debug_every_n', 3)
         self.declare_parameter('debug_scale', 0.5)
-        # ROTA KAYNAĞI. Bu pistte boyalı şerit yok; şerit çizgisi modeli bariyer
-        # kenarlarını çizgi sanıyor ve rota bariyerden türetiliyordu. Sürülebilir
-        # alan maskesi ise yolu ve virajı net veriyor - zaten hesaplanıyordu ama
-        # sadece görselleştirmede kullanılıyordu.
-        #   'mesafe' = sağdaki çizgiyi METRİK mesafede tutar (hedef_sag_mesafe_m);
-        #              derinlik gerektirir, tek çizgi görünce de çalışır
-        #   'yol'    = sürülebilir alanın koridor ortası (boyasız pist için)
-        #   'serit'  = şerit çizgileri (boyalı yol için, eski davranış)
-        #   'auto'   = çizgiler sürülebilir alanın içindeyse 'serit', değilse 'yol'
-        # VARSAYILAN 'mesafe': pistte asfalta boya ÇİZİLMİŞ, kenarda bariyer var.
-        # Kayıt analizinde (7.6 dk, 1184 kare) rota kaynağı %100 şerit, şerit
-        # kaybı %1.3 - yani çizgiler tutarlı görülüyor, bariyere kaçmıyor.
         self.declare_parameter('route_source', 'mesafe')
         # 'auto' için: kaç satırda İKİ çizgi de sürülebilir alanın içinde olmalı
         # (bkz. _looks_like_paint - bariyerler alanın dışında kalır)
@@ -330,6 +274,10 @@ class LaneDetectionNode(Node):
         # alt üçü (0.95/0.90/0.85) doğrudan gövdenin üstüne düşüyordu.
         # Kalibrasyon: debug karesinde kaputun üst kenarı görüntünün yüzde kaçında?
         # ✓ kayıttan doğrulandı (0.832)
+
+
+
+        
         self.declare_parameter('hood_frac', 0.82)
         # TANI: her örnekleme satırındaki koridor kenarlarını ve merkezini loglar.
         # Rota yamuk çıktığında hangi satırın bozulduğu ancak böyle görülüyor -
@@ -356,6 +304,7 @@ class LaneDetectionNode(Node):
         self.mesafe_alt_sinir_m = float(self.get_parameter('mesafe_alt_sinir_m').value)
         self.mesafe_ust_sinir_m = float(self.get_parameter('mesafe_ust_sinir_m').value)
         self.mesafe_sicrama_esigi_m = float(self.get_parameter('mesafe_sicrama_esigi_m').value)
+        self.ayni_cizgi_tol_m = float(self.get_parameter('ayni_cizgi_tol_m').value)
         self.mesafe_sicrama_kabul_kare = int(
             self.get_parameter('mesafe_sicrama_kabul_kare').value)
         self._sicrama_sayaci = 0
@@ -476,6 +425,7 @@ class LaneDetectionNode(Node):
                    'lane_width_min_frac', 'lane_width_max_frac',
                    'hedef_sag_mesafe_m', 'mesafe_hata_olcegi_m',
                    'mesafe_sicrama_esigi_m', 'mesafe_sicrama_kabul_kare',
+                   'ayni_cizgi_tol_m',
                    'mesafe_alt_sinir_m', 'mesafe_ust_sinir_m',
                    'merkez_bandi_m', 'kenar_kazanci', 'serit_genisligi_m',
                    'derinlik_pencere_px',
@@ -978,10 +928,10 @@ class LaneDetectionNode(Node):
 
         return inside_rows >= self.min_paint_rows
 
-    def _mesafe_sapmasi(self, lane_mask):
+    def _mesafe_sapmasi(self, lane_mask, da_mask):
         """Sağ çizgiye olan metrik mesafeyi hedefle kıyaslayıp sapma üretir."""
         height, width = lane_mask.shape
-        olcum = self._sag_cizgi_mesafesi(lane_mask)
+        olcum = self._sag_cizgi_mesafesi(lane_mask, da_mask)
 
         # BAND: ELEME DEĞİL KIRPMA.
         # Eskiden bandın dışını atıyordum ama bu, aracın şeritten KAÇTIĞI anı
@@ -990,8 +940,14 @@ class LaneDetectionNode(Node):
         # Doğrusu yönü korumak: 2.5 m üstü okuma 'çok soldayım, sağa git'
         # bilgisini taşır; büyüklüğü sınırlanır ama bilgi atılmaz.
         band_disi = False
+        ham_mesafe = None
         if olcum is not None:
             ham = olcum[0]
+            # HAM değer saklanır: aşağıdaki ŞERİT GEÇİŞ testi bunu ister.
+            # Kırpılmış değerle ('mesafe') test edilemez, çünkü geçiş anındaki
+            # okuma tanımı gereği bandın DIŞINDADIR (bir şerit genişliği kadar
+            # sıçramıştır) ve kırpma tam o bilgiyi siler.
+            ham_mesafe = ham
             kirpik = float(np.clip(ham, self.mesafe_alt_sinir_m,
                                    self.mesafe_ust_sinir_m))
             if kirpik != ham:
@@ -1042,34 +998,60 @@ class LaneDetectionNode(Node):
         onceki = self.son_mesafe_m
         if (onceki is not None
                 and abs(mesafe - onceki) > self.mesafe_sicrama_esigi_m):
-            # ŞERİT DEĞİŞTİRME Mİ? Araç kendi sol çizgisini geçerse o çizgi
-            # artık SAĞINDA kalır ve 'en yakın sağ çizgi' bir anda o olur:
-            # okuma bir ŞERİT GENİŞLİĞİ kadar düşer. Bunu kabul etmek aracı
-            # yan şeridin ortasına yerleştirir ve kontrol açısından her şey
-            # yolunda görünür - şerit ihlali tam olarak böyle oluyor.
-            # Okumayı bir şerit genişliği ekleyerek ESKİ çizgiye geri
-            # çeviriyoruz: araç 'çok soldayım' bilgisini alır ve sağa döner.
+            # ŞERİT DEĞİŞTİRME Mİ? İKİ YÖNDE DE olabilir; ikisi de aynı şeyi
+            # anlatır: takip edilen çizgi değişti, okumayı ESKİ çizgiye geri
+            # çevirmek gerekir.
+            #
+            #   SOL çizgi geçildi -> o çizgi artık SAĞIMIZDA kalır ve 'en yakın
+            #     sağ çizgi' bir anda o olur: okuma bir ŞERİT GENİŞLİĞİ kadar
+            #     DÜŞER. Geri çevirmek için +W. Araç 'çok soldayım' bilgisini
+            #     alır ve sağa döner.
+            #
+            #   SAĞ çizgi geçildi -> takip ettiğimiz çizgi SOLUMUZDA kaldığı
+            #     için artık hiç sayılmıyor (x > u_arac şartı) ve 'en yakın sağ
+            #     çizgi' KOMŞU şeridin çizgisi oluyor: okuma bir şerit genişliği
+            #     kadar ARTAR. Geri çevirmek için -W. Sonuç NEGATİF çıkabilir ve
+            #     ÇIKMALIDIR: 'kendi çizgimin 10 cm sağındayım' bilgisi budur,
+            #     hata büyük negatif olur ve araç sola çekilir.
+            #
+            # Eskiden yalnız +W denetleniyordu. Sağa taşma bu yüzden hiç
+            # yakalanmıyordu: sıçrama kilidi mesafe_sicrama_kabul_kare kadar
+            # bekleyip KOMŞU şeridin çizgisini referans kabul ediyor, hata
+            # yeniden sıfıra oturuyor ve araç 'sağa kır' komutunu sürdürerek
+            # komşu şeride yerleşiyordu - kontrolcüye göre her şey yolunda.
+            #
+            # Aday HAM okumadan türetilir (ham_mesafe): geçiş anındaki okuma
+            # tanımı gereği makul bandın dışındadır, kırpılmış değerle bu test
+            # hiçbir zaman tutmaz.
             W = self.serit_genisligi_m
-            if W > 0 and abs((mesafe + W) - onceki) < abs(mesafe - onceki):
-                duzeltilmis = mesafe + W
-                if abs(duzeltilmis - onceki) <= self.mesafe_sicrama_esigi_m:
-                    if self._sicrama_sayaci == 0:
-                        self.get_logger().warn(
-                            f'🚧 ŞERİT ÇİZGİSİ GEÇİLDİ: ölçüm {mesafe:.2f} m '
-                            f'(referans {onceki:.2f} m). Bir şerit genişliği '
-                            f'eklenip {duzeltilmis:.2f} m sayıldı - araç kendi '
-                            f'şeridine geri çekiliyor.')
-                    self._sicrama_sayaci = 0
-                    self.lost_frames = 0
-                    self.lane_valid = True
-                    self.debug_source = 'serit-gecildi'
-                    self.son_mesafe_m = duzeltilmis
-                    hata = duzeltilmis - self.hedef_sag_mesafe_m
-                    band = max(self.merkez_bandi_m, 0.0)
-                    etkin = (hata if abs(hata) <= band else math.copysign(
-                        band + (abs(hata) - band) * max(self.kenar_kazanci, 1.0), hata))
-                    return self._yumusat_ve_sinirla(float(np.clip(
-                        etkin / max(self.mesafe_hata_olcegi_m, 1e-3), -1.0, 1.0)))
+            duzeltilmis = None
+            gecilen = None
+            if W > 0 and ham_mesafe is not None:
+                for aday, yon in ((ham_mesafe + W, 'SOL'), (ham_mesafe - W, 'SAĞ')):
+                    if (abs(aday - onceki) < abs(ham_mesafe - onceki)
+                            and abs(aday - onceki) <= self.mesafe_sicrama_esigi_m):
+                        duzeltilmis, gecilen = aday, yon
+                        break
+            if duzeltilmis is not None:
+                if self._sicrama_sayaci == 0:
+                    self.get_logger().warn(
+                        f'🚧 {gecilen} ŞERİT ÇİZGİSİ GEÇİLDİ: ölçüm '
+                        f'{ham_mesafe:.2f} m (referans {onceki:.2f} m). Bir '
+                        f'şerit genişliği '
+                        f'{"eklenip" if gecilen == "SOL" else "çıkarılıp"} '
+                        f'{duzeltilmis:.2f} m sayıldı - araç kendi şeridine '
+                        f'geri çekiliyor.')
+                self._sicrama_sayaci = 0
+                self.lost_frames = 0
+                self.lane_valid = True
+                self.debug_source = 'serit-gecildi'
+                self.son_mesafe_m = duzeltilmis
+                hata = duzeltilmis - self.hedef_sag_mesafe_m
+                band = max(self.merkez_bandi_m, 0.0)
+                etkin = (hata if abs(hata) <= band else math.copysign(
+                    band + (abs(hata) - band) * max(self.kenar_kazanci, 1.0), hata))
+                return self._yumusat_ve_sinirla(float(np.clip(
+                    etkin / max(self.mesafe_hata_olcegi_m, 1e-3), -1.0, 1.0)))
 
             # KİLİT TAKILI KALMASIN: üst üste bu kadar kare aynı şeyi
             # ölçüyorsak sıçrama değil gerçek hareket; referansı yenile.
@@ -1149,7 +1131,7 @@ class LaneDetectionNode(Node):
             return None
         return float(np.median(gecerli))
 
-    def _sag_cizgi_mesafesi(self, lane_mask):
+    def _sag_cizgi_mesafesi(self, lane_mask, da_mask):
         """Araç orta çizgisinin SAĞINDAKİ en yakın çizgiye METRİK uzaklık.
 
         Dönen: (mesafe_m, u, v) ya da None.
@@ -1157,6 +1139,13 @@ class LaneDetectionNode(Node):
         Yanal uzaklık pinhole modelinden: X = (u - u_arac) * Z / fx.
         u_arac aracın orta çizgisi (ekrandaki mavi çizgi), Z o pikseldeki
         ZED derinliği. Perspektif/ufuk varsayımı YOK - ölçülen mesafe bu.
+
+        BARİYER ELEMESİ (da_mask): model bariyer/korkuluk kenarlarını da
+        'şerit çizgisi' sayıyor. Bu fonksiyon SADECE 'en yakın sağ nokta'ya
+        baktığı için bariyer, gerçek çizgiden daha yakınsa onun yerine
+        ölçülüyordu - araç var olmayan bir çizgiyi 1.5 m'de tutmaya çalışıp
+        şeritten çıkıyor. Piksel modundaki _lane_centers_at_rows bu elemeyi
+        zaten yapıyordu (bkz. _bariyerleri_ele); metrik mod atlıyordu.
         """
         if self.fx is None or self.depth_image is None:
             return None
@@ -1164,6 +1153,9 @@ class LaneDetectionNode(Node):
         band = max(2, int(height * 0.006))
         merge_gap = max(4, int(width * 0.012))
         max_cluster_px = int(width * 0.25)
+        # _lane_centers_at_rows ile AYNI tolerans: iki yol da aynı bariyeri
+        # aynı şekilde elesin, yoksa mod değişince davranış sessizce kayar.
+        bariyer_tol = max(3, int(width * 0.006))
         u_arac = width / 2.0 + self.camera_center_offset_px
 
         # Tüm satırlardan ölç, sonra HEDEF İLERİ MESAFEYE en yakın olanı seç.
@@ -1173,6 +1165,10 @@ class LaneDetectionNode(Node):
             v = int(height * frac)
             noktalar = self._row_lane_points(lane_mask, v, band, merge_gap,
                                              max_cluster_px)
+            # Bariyerleri EN BAŞTA ele: 'en yakın sağ nokta' seçimine hiç
+            # girmesinler. Sonradan elemek işe yaramaz - seçim çoktan yapılmış olur.
+            if self.paint_inside_only:
+                noktalar = self._bariyerleri_ele(noktalar, v, da_mask, bariyer_tol)
             sagdakiler = [x for x in noktalar if x > u_arac]
             if not sagdakiler:
                 continue
@@ -1185,10 +1181,29 @@ class LaneDetectionNode(Node):
         if not adaylar:
             return None
 
+        # ÖNCE EN YAKIN SAĞ ÇİZGİYE KİLİTLEN, SONRA ÖLÇ.
+        # Her satır kendi 'en yakın sağ noktasını' veriyor ama satırlar
+        # birbirinden BAĞIMSIZ: alttaki satır gerçek şerit çizgisini, üstteki
+        # satır saha kenarını/bariyeri yakalayabiliyor. Eskiden bütün adaylara
+        # TEK bir doğru uyduruluyordu; farklı cisimler aynı fite girince sonuç
+        # ikisinin arasında bir yere düşüyor ve aracın kendi çizgisiyle ilgisi
+        # kalmıyordu. Pistte görülen buydu: bariyerden gelen 3.5-6 m'lik okuma
+        # makul banda KIRPILIP 2.50 m diye geçiyor, hata sabit +1.0 m kalıyor
+        # ve direksiyon sağa dayanmış halde kilitleniyordu.
+        #
+        # Aracın KENDİ sağ çizgisi, tanımı gereği sağdaki EN YAKIN çizgidir.
+        # O yüzden önce en küçük yanal mesafeli aday bulunur, sonra yalnızca
+        # onunla AYNI ÇİZGİYE ait olabilecek adaylar tutulur; bariyer ve komşu
+        # şeridin çizgisi ölçüme hiç girmez.
+        en_kucuk = min(p[0] for p in adaylar)
+        adaylar = [p for p in adaylar
+                   if p[0] - en_kucuk <= self.ayni_cizgi_tol_m]
+
         # HEDEF MESAFEDEKİ DEĞERİ ARA DEĞERLEMEYLE bul. 'En yakın noktayı seç'
         # yetmiyor: o mesafede hiç nokta yoksa ölçüm yine zıplıyor. Noktalara
         # doğru uydurup hedef Z'de değerlendirmek, hangi satırların veri
         # verdiğinden BAĞIMSIZ ve karşılaştırılabilir bir mesafe üretir.
+        # (Artık fit YALNIZCA tek bir çizginin noktalarına çekiliyor.)
         hedef_z = self.olcum_ileri_mesafe_m
         en_yakin = min(adaylar, key=lambda p: abs(p[1] - hedef_z))
         if len(adaylar) >= 2:
@@ -1249,7 +1264,7 @@ class LaneDetectionNode(Node):
         # ufuk kalibrasyonuna ihtiyaç duymaz - gerçek kayıtta bunların hepsi
         # kararsızdı (satırların %85'inde tek çizgi görülüyor).
         if self.route_source == 'mesafe':
-            return self._mesafe_sapmasi(lane_mask)
+            return self._mesafe_sapmasi(lane_mask, da_mask)
 
         center_ref = width / 2.0 + self.camera_center_offset_px
 

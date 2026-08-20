@@ -1,4 +1,4 @@
-# Dosya Adı: launch_all_nodes.py 
+# Dosya Adı: launch_all_nodes.py
 
 import multiprocessing
 import time
@@ -31,23 +31,15 @@ def lidar_portu_bul():
 LIDAR_PORT = lidar_portu_bul()
 
 # --- DÜĞÜM BAŞLATMA SIRASI VE DOSYA YOLLARI ---
-# Yollar, bu launch dosyasının bulunduğu klasöre (SahiOtonom) göre otomatik hesaplanır.
-# Böylece projeyi başka bir yere taşısan bi
-#
-# le yolları elle güncellemene gerek kalmaz.
+# Yollar, bu launch dosyasının bulunduğu klasöre (SahiOtonom) göre otomatik
+# hesaplanır. Böylece projeyi başka bir yere taşısan bile yolları elle
+# güncellemene gerek kalmaz.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # --- PIST KAYDI --------------------------------------------------------------
 # Burasi True yapilirsa sistem calisirken ham sensor verisi otomatik kaydedilir.
-# Pistte ayri terminal acip komut yazmak gerekmesin diye burada: sure
-# kisitliyken en az adim en az hata demek.
-# (Eskiden kalibrasyon.yaml'dan okunuyordu; o dosya 2026-08-18'de kaldirildi.)
-# Sistemi baslatmadan acmak icin:  KAYIT_ACIK = True
-# Sistem zaten calisiyorsa ayri kayit icin:  ./pist_kayit.sh
-# DIKKAT: DISK. RGB (~83 MB/sn) + derinlik (~110 MB/sn) = ~190 MB/sn ham;
-# zstd ile kabaca ucte biri. Bir dakikalik kayit ~4 GB. Viraj ayari icin
-# TEK VIRAJ yeter, tur atmaya gerek yok.
-KAYIT_ACIK = True
+
+KAYIT_ACIK = False
 
 KAYIT_KLASORU = os.path.join(BASE_DIR, 'kayitlar')
 KAYIT_ADI = time.strftime('pist_%Y%m%d_%H%M%S')
@@ -56,13 +48,6 @@ KAYIT_TOPICLERI = [
     '/scan',                  # engel tespitinin girdisi
     '/zed2i/odom',            # ZED odometrisi (aciksa)
     # DERINLIK + KAMERA BILGISI (eklendi 2026-08-19). Serit dugumu METRIK modda
-    # (route_source='mesafe') calisiyor: sag cizginin metre cinsinden mesafesi
-    # ve viraj tespiti tamamen derinlige dayaniyor. Bu ikisi olmadan tekrar
-    # oynatmada fx/depth_image None kalir, _sag_cizgi_noktalari BOS doner ve
-    # viraj hic olculmez - eski kayitlarla viraj ayari yapilamamasinin sebebi
-    # buydu (kayitta yalnizca image_raw + odom vardi).
-    # BEDELI: derinlik float32 720p, ~100 MB/sn. Viraj ayari icin TUR degil
-    # TEK VIRAJ, 30-60 sn kaydi yeter.
     '/zed2i/depth',
     '/zed2i/camera_info',
 ]
@@ -78,16 +63,18 @@ NODE_LAUNCH_ORDER = [
         "delay_after": 6,
         "critical": True
     },
-        {
+    {
         "name": "ŞERİT TESPİT",
         "file_path": os.path.join(BASE_DIR, "SeritTespit/serit-tespitcopy.py"),
         "delay_after": 2
     },
-    {
-        "name": "LEVHA TESPİT (Görüntü İşleme)",
-        "file_path": os.path.join(BASE_DIR, "GoruntuIsleme/run_tracker.py"),
-        "delay_after": 3
-    },
+
+    # {
+    #    "name": "LEVHA TESPİT (Görüntü İşleme)",
+    #     "file_path": os.path.join(BASE_DIR, "GoruntuIsleme/run_tracker.py"),
+    #     "delay_after": 3
+    # },
+
     {
         # Şerit + levha görüntülerini TEK pencerede yan yana gösterir
         "name": "BİRLEŞİK GÖRÜNTÜ (Yol + Levhalar)",
@@ -98,7 +85,7 @@ NODE_LAUNCH_ORDER = [
         # LiDAR DONANIM SÜRÜCÜSÜ. Eskiden bu ayrı terminalde elle başlatılıyordu
         # ve unutulduğunda /scan hiç yayınlanmıyordu: engel-tespit.py sessizce
         # ayakta kalıyor ("initialized" yazıyor) ama tek bir ölçüm bile almıyor,
-        # yani engel teslaunpiti çalışıyor sanılıp aslında hiç çalışmıyordu.
+        # yani engel tespiti çalışıyor sanılıp aslında hiç çalışmıyordu.
         # RPLIDAR S2M1-R2: baud 1000000 (A1'in 115200'ü DEĞİL).
         "name": "LIDAR SÜRÜCÜSÜ (RPLIDAR S2)",
         # Doğrudan 'ros2 launch' değil, RESET atan sarmalayıcı: RPLIDAR besleme
@@ -128,11 +115,23 @@ NODE_LAUNCH_ORDER = [
         "file_path": os.path.join(BASE_DIR, "Haberlesme/uart_sender_node3.py"),
         "delay_after": 2
     },
+    {
+        # SLALOM. UART'tan SONRA başlıyor: slalom kontrol zincirinin bir parçası
+        # DEĞİL, yalnızca '/lane/lateral_deviation'ın anlamını değiştiriyor.
+        # Sonda başlaması, o ana kadar sistemin normal davranmasını sağlar.
+        #
+        # ⚠️  ÖN KOŞUL: şerit tespit düğümü sapmayı '/lane/lateral_deviation'
+        #     yerine '/lane/lateral_deviation_raw' topic'ine yayınlamalı.
+        #     Slalom onu dinler, kaydırma ekler, '/lane/lateral_deviation'a yazar.
+        #     İkisi de aynı topic'e yazarsa DİREKSİYON ÇEKİŞİR. Slalom düğümü
+        #     bunu açılışta yakalayıp hata verir - araç kaçmaz, slalom çalışmaz.
+        "name": "SLALOM (şerit değiştirme)",
+        "file_path": os.path.join(BASE_DIR, "Slalom/slalom_node.py"),
+        "delay_after": 2
+    },
 ]
 
 if KAYIT_ACIK:
-    # En sona eklenir: diger dugumler yayina baslamis olur, kaydin ilk saniyesi
-    # bos gecmez. CTRL+C'de run_command proses grubunu kapattigi icin kayit
     # duzgun sonlanir ve dosya bozuk kalmaz.
     os.makedirs(KAYIT_KLASORU, exist_ok=True)
     NODE_LAUNCH_ORDER.append({
@@ -151,6 +150,7 @@ if KAYIT_ACIK:
         "delay_after": 2
     })
 
+
 def run_script(script_path):
     """Verilen tam yoldaki Python script'ini çalıştırır."""
     try:
@@ -158,20 +158,20 @@ def run_script(script_path):
         # Bu, script'in kendi içindeki 'utils' gibi yerel importları bulabilmesi için KRİTİK!
         script_dir = os.path.dirname(script_path)
         sys.path.insert(0, script_dir)
-        
+
         print(f"[{os.getpid()}] Proses başlatıldı: {os.path.basename(script_path)}")
-        
+
         module_name = os.path.splitext(os.path.basename(script_path))[0]
         spec = importlib.util.spec_from_file_location(module_name, script_path)
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
         spec.loader.exec_module(module)
-        
+
         if hasattr(module, 'main'):
             module.main()
         else:
             print(f"HATA: {script_path} içinde 'main' fonksiyonu bulunamadı.", file=sys.stderr)
-            
+
         # Eklenen yolu temizle
         sys.path.pop(0)
 
@@ -179,6 +179,7 @@ def run_script(script_path):
         print(f"[{os.getpid()}] HATA ({os.path.basename(script_path)}): {e}", file=sys.stderr)
         import traceback
         traceback.print_exc()
+
 
 def run_command(command, yeniden_baslat=False):
     """Harici bir komutu (ör. 'ros2 launch') çalıştırır.
@@ -335,6 +336,7 @@ if __name__ == '__main__':
             sys.exit(1)
 
         print("\n✅ Tüm düğümler başarıyla ve sırayla başlatıldı.")
+        print("🏁 Slalom durumu:  ros2 topic echo /slalom/durum")
         if KAYIT_ACIK:
             print(f"🔴 KAYIT ALINIYOR -> kayitlar/{KAYIT_ADI}")
             print("   Turu attıktan sonra CTRL+C ile bitirin, kayıt kapanır.")
